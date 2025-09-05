@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: pymultiwii
+Version: 1.6
+Summary: MultiWii Serial Protocol (MSP) API to send and receive data from firmware using MSP
+Home-page: https://github.com/alduxvm/pyMultiWii
+Author: Aldo Vargas
+License: GPL
+License-File: LICENSE
+Dynamic: author
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: summary
