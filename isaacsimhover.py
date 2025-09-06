@@ -1,76 +1,63 @@
 # Isaac Sim 5.0 — Script Editor
-# Use EXISTING Iris at IRIS_ROOT_PATH:
-#   (A) Fix dynamic collision setup: apply MeshCollisionAPI and set convex approximations
-#       on /World/iris/body and all descendant Meshes (or whole Iris subtree if configured).
-#       Optionally author density/mass and PhysX damping.
-#   (B) Attach a smoothed hover controller (PD + deadband + low-pass + cmd smoothing) to reduce "dance".
+# EXISTING Iris + UDP JSON listener for position setpoints + smooth hover controller (verbose).
+# Listens on UDP 0.0.0.0:6000 for JSON:
+#   {"cmd":"setpos", "x": <meters>, "y": <meters>, "alt": <meters>}
+#   {"cmd":"nudge",  "dx": <m>, "dy": <m>, "dalt": <m>}  # שינוי יחסי
 #
-# Nothing is spawned or moved. Case-sensitive paths!
+# Does NOT spawn prims; attaches to your existing Iris by path below.
 
-from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Sdf, Gf
+from pxr import Usd, UsdPhysics, PhysxSchema, Gf
 import carb
 import omni
 import omni.usd
 import omni.timeline
 import omni.kit.app
 from omni.isaac.dynamic_control import _dynamic_control
+import threading, time, socket, json
 
-# ====== USER SETTINGS (edit to your scene) ====================================
-IRIS_ROOT_PATH   = "/World/iris"              # existing Iris root prim
-BODY_CANDIDATES  = ["body", "base_link"]      # first one found is used as the dynamic body
+# ===================== USER SETTINGS =====================
+IRIS_ROOT_PATH = "/World/iris"          # existing Iris prim (case-sensitive)
+BODY_CANDIDATES = ["body", "base_link"]
 
-# What to scan/fix for collisions:
-FIX_SCOPE        = "body_subtree"             # "body_subtree" | "root_subtree"
-APPROXIMATION    = "convexDecomposition"      # "convexDecomposition" (recommended) or "convexHull"
+# UDP server (listening) — same machine or LAN
+UDP_HOST = "0.0.0.0"
+UDP_PORT = 6000
 
-# Mass authoring (choose one):
-MASS_MODE        = "density"                  # "none" | "mass" | "density"
-MASS_KG          = 1.2                        # used if MASS_MODE == "mass"
-DENSITY_KG_M3    = 300.0                      # used if MASS_MODE == "density"
+# NED/world: כאן זה פשוט world XY ו-alt למעלה (בלי NED)
+# Verbose
+VERBOSE_RX = True
+RX_PRINT_PERIOD = 0.25     # seconds
+APPLY_BODY_CONVEX_FIX = True  # נסה להשתיק את ה-warning על body mesh פעם אחת
+# =========================================================
 
-# PhysX damping (helps stability; won't lock angles):
-ANG_DAMPING      = 12.0
-LIN_DAMPING      = 0.4
-# ==============================================================================
+# ===== Hover target & controller tuning =====
+TARGET_POS_XY = Gf.Vec2d(0.0, 0.0)  # meters
+TARGET_ALT_Z  = 2.0                 # meters AGL-ish
 
-# ====== Hover controller tuning ===============================================
-TARGET_POS_XY    = Gf.Vec2d(0.0, 0.0)
-TARGET_ALT_Z     = 2.0
+KP_Z,  KD_Z   = 1.8, 3.4
+KP_XY, KD_XY  = 1.2, 0.8
+VEL_CLAMP_Z   = 6.0
+VEL_CLAMP_XY  = 6.0
 
-# PD gains & clamps
-KP_Z, KD_Z       = 5.0, 3.4
-KP_XY, KD_XY     = 5.0, 0.8
-VEL_CLAMP_Z      = 10.0
-VEL_CLAMP_XY     = 10.0
+Z_ERR_DB, Z_VEL_DB   = 0.03, 0.05
+XY_ERR_DB, XY_VEL_DB = 0.02, 0.05
 
-# Deadbands (m / m/s)
-Z_ERR_DB         = 0.03
-Z_VEL_DB         = 0.05
-XY_ERR_DB        = 0.02
-XY_VEL_DB        = 0.05
+EMA_VZ, EMA_VXY = 0.25, 0.25
+SMOOTH_Z, SMOOTH_XY = 0.5, 0.5
 
-# Low-pass filtering for measured velocities (EMA alphas)
-EMA_VZ           = 0.25
-EMA_VXY          = 0.25
+ZERO_ANGVEL_EACH_FRAME = True
+ANG_DAMPING, LIN_DAMPING = 12.0, 0.4
+# ===========================================
 
-# Command smoothing alphas
-SMOOTH_Z         = 0.5
-SMOOTH_XY        = 0.5
-
-ZERO_ANGVEL_EACH_FRAME = True  # soft “attitude hold”
-# ==============================================================================
-
-# ---------- Internals (no edit) -----------
+# ---------- Internals ----------
 dc = _dynamic_control.acquire_dynamic_control_interface()
 _stage = omni.usd.get_context().get_stage()
 _app = omni.kit.app.get_app()
 _timeline = omni.timeline.get_timeline_interface()
-
 _update_sub = None
 _body_path = None
 _body_handle = None
 
-# Filters' state
 _vx_meas_f = 0.0
 _vy_meas_f = 0.0
 _vz_meas_f = 0.0
@@ -78,126 +65,50 @@ _vx_cmd_s  = 0.0
 _vy_cmd_s  = 0.0
 _vz_cmd_s  = 0.0
 
+# UDP state
+_udp_sock = None
+_udp_thread = None
+_udp_stop = False
+_last_rx_print = 0.0
+
+# ---------- Helpers ----------
 def _get_prim(path):
     p = _stage.GetPrimAtPath(path)
     return p if p and p.IsValid() else None
 
 def _find_body_prim(root_prim):
-    # 1) try common child names
     for name in BODY_CANDIDATES:
-        cand = _get_prim(f"{root_prim.GetPath().pathString}/{name}")
-        if cand:
+        cand = _stage.GetPrimAtPath(f"{root_prim.GetPath().pathString}/{name}")
+        if cand and cand.IsValid():
             return cand
-    # 2) first prim that already has a rigid body API
     for p in Usd.PrimRange(root_prim):
         try:
             if p.HasAPI(UsdPhysics.RigidBodyAPI):
                 return p
         except Exception:
             pass
-    # 3) fallback to root
     return root_prim
 
-def _ensure_body_and_collider(prim):
+def _apply_damping(prim):
     if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
         UsdPhysics.RigidBodyAPI.Apply(prim)
     if not prim.HasAPI(UsdPhysics.CollisionAPI):
         UsdPhysics.CollisionAPI.Apply(prim)
+    rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    rb.CreateAngularDampingAttr(ANG_DAMPING)
+    rb.CreateLinearDampingAttr(LIN_DAMPING)
 
-def _set_mesh_approx(mesh_prim, approx_token):
-    # Ensure Collision + MeshCollisionAPI; set approximation token
-    if not mesh_prim.HasAPI(UsdPhysics.CollisionAPI):
-        UsdPhysics.CollisionAPI.Apply(mesh_prim)
-    mapi = UsdPhysics.MeshCollisionAPI.Apply(mesh_prim)
-    # Create... returns the attr (existing or new); Set to enforce value
-    attr = mapi.CreateApproximationAttr(approx_token)
-    attr.Set(approx_token)
-
-def _author_mass(body_prim):
-    if MASS_MODE == "none":
-        print("[Fix] MASS_MODE=none -> leave mass to default/auto")
-        return
-    if not body_prim.HasAPI(UsdPhysics.MassAPI):
-        UsdPhysics.MassAPI.Apply(body_prim)
-    m = UsdPhysics.MassAPI(body_prim)
-    if MASS_MODE == "mass":
-        m.CreateMassAttr(MASS_KG)
-        # clear density if authored
-        dens = m.GetDensityAttr()
-        if dens and dens.HasAuthoredValueOpinion():
-            dens.Clear()
-        print(f"[Fix] Mass authored: {MASS_KG} kg on {body_prim.GetPath()}")
-    elif MASS_MODE == "density":
-        m.CreateDensityAttr(DENSITY_KG_M3)
-        mass = m.GetMassAttr()
-        if mass and mass.HasAuthoredValueOpinion():
-            mass.Clear()
-        print(f"[Fix] Density authored: {DENSITY_KG_M3} kg/m^3 on {body_prim.GetPath()}")
-
-def _author_damping(body_prim):
+def _optional_fix_body_convex(body_prim):
+    # אם ה-body עצמו Mesh ויש לו collision triangle — שנה ל-convexDecomposition
     try:
-        rb = PhysxSchema.PhysxRigidBodyAPI.Apply(body_prim)
-        # set only if not authored already
-        ang = rb.GetAngularDampingAttr()
-        lin = rb.GetLinearDampingAttr()
-        if not ang.HasAuthoredValueOpinion():
-            rb.CreateAngularDampingAttr(ANG_DAMPING)
-        if not lin.HasAuthoredValueOpinion():
-            rb.CreateLinearDampingAttr(LIN_DAMPING)
-        print(f"[Fix] Damping authored (angular≈{ANG_DAMPING}, linear≈{LIN_DAMPING})")
+        if body_prim.GetTypeName() == "Mesh":
+            if not body_prim.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI.Apply(body_prim)
+            mapi = UsdPhysics.MeshCollisionAPI.Apply(body_prim)
+            mapi.CreateApproximationAttr("convexDecomposition").Set("convexDecomposition")
+            print("[Fix] Body mesh set to convexDecomposition", flush=True)
     except Exception as e:
-        print(f"[Fix] WARN: could not author PhysX damping: {e}")
-
-def fix_collisions_and_mass():
-    """Apply convex approximation to triangle-mesh colliders and author mass/damping."""
-    iris_root = _get_prim(IRIS_ROOT_PATH)
-    if not iris_root:
-        print(f"[Fix] ERROR: Prim not found at '{IRIS_ROOT_PATH}'")
-        return None
-
-    body_prim = _find_body_prim(iris_root)
-    if not body_prim:
-        print(f"[Fix] ERROR: Could not locate body under '{IRIS_ROOT_PATH}'")
-        return None
-
-    print(f"[Fix] Using body prim: {body_prim.GetPath()}")
-    _ensure_body_and_collider(body_prim)
-
-    # Choose traversal root
-    traversal_root = body_prim if FIX_SCOPE == "body_subtree" else iris_root
-
-    updated = []
-    skipped = []
-
-    # Include the traversal_root itself if it's a Mesh (this fixes the exact warning on /World/iris/body)
-    if traversal_root.GetTypeName() == "Mesh":
-        try:
-            _set_mesh_approx(traversal_root, APPROXIMATION)
-            updated.append(str(traversal_root.GetPath()))
-        except Exception as e:
-            skipped.append(f"{traversal_root.GetPath()} (body mesh) -> {e}")
-
-    for p in Usd.PrimRange(traversal_root):
-        if p == traversal_root:
-            continue  # already handled
-        if p.GetTypeName() == "Mesh":
-            try:
-                _set_mesh_approx(p, APPROXIMATION)
-                updated.append(str(p.GetPath()))
-            except Exception as e:
-                skipped.append(f"{p.GetPath()} -> {e}")
-
-    print(f"[Fix] Applied approximation='{APPROXIMATION}' on {len(updated)} Mesh collider(s).")
-    if skipped:
-        print("[Fix] Skipped/Errors:")
-        for s in skipped:
-            print("   -", s)
-
-    # Mass/density & damping
-    _author_mass(body_prim)
-    _author_damping(body_prim)
-
-    return body_prim
+        print("[Fix] WARN:", e, flush=True)
 
 def _get_pose_dc(handle):
     pose = dc.get_rigid_body_pose(handle)
@@ -208,13 +119,11 @@ def _get_pose_dc(handle):
     w = Gf.Vec3d(ang.x, ang.y, ang.z)
     return p, v, w
 
-def _clamp(val, lo, hi):
-    return hi if val > hi else lo if val < lo else val
+def _clamp(val, lo, hi): return hi if val > hi else lo if val < lo else val
 
+# ---------- Per-frame controller ----------
 def _on_update(e: carb.events.IEvent):
-    """Per-frame hover controller with XY+Z filtering and smoothing."""
     global _body_handle, _vx_meas_f, _vy_meas_f, _vz_meas_f, _vx_cmd_s, _vy_cmd_s, _vz_cmd_s
-
     if not _timeline.is_playing() or _body_path is None:
         return
 
@@ -229,78 +138,150 @@ def _on_update(e: carb.events.IEvent):
 
     p, v, w = _get_pose_dc(_body_handle)
 
-    # Soft attitude damp: kill angular vel
     if ZERO_ANGVEL_EACH_FRAME:
         dc.set_rigid_body_angular_velocity(_body_handle, carb.Float3(0.0, 0.0, 0.0))
 
-    # ---- Z axis ----
+    # Z
     _vz_meas_f = (1.0 - EMA_VZ) * _vz_meas_f + EMA_VZ * v[2]
-    ez  = TARGET_ALT_Z - p[2]
-    evz = -_vz_meas_f
+    ez, evz = TARGET_ALT_Z - p[2], -_vz_meas_f
+    vz_raw = 0.0 if (abs(ez) < Z_ERR_DB and abs(_vz_meas_f) < Z_VEL_DB) else (KP_Z*ez + KD_Z*evz)
+    vz_raw = _clamp(vz_raw, -VEL_CLAMP_Z, VEL_CLAMP_Z)
+    _vz_cmd_s = (1.0 - SMOOTH_Z)*_vz_cmd_s + SMOOTH_Z*vz_raw
 
-    if abs(ez) < Z_ERR_DB and abs(_vz_meas_f) < Z_VEL_DB:
-        vz_cmd_raw = 0.0
-    else:
-        vz_cmd_raw = KP_Z * ez + KD_Z * evz
-
-    vz_cmd_raw = _clamp(vz_cmd_raw, -VEL_CLAMP_Z, VEL_CLAMP_Z)
-    _vz_cmd_s  = (1.0 - SMOOTH_Z) * _vz_cmd_s + SMOOTH_Z * vz_cmd_raw
-
-    # ---- XY axes ----
+    # XY
     _vx_meas_f = (1.0 - EMA_VXY) * _vx_meas_f + EMA_VXY * v[0]
     _vy_meas_f = (1.0 - EMA_VXY) * _vy_meas_f + EMA_VXY * v[1]
-
     ex, ey = TARGET_POS_XY[0] - p[0], TARGET_POS_XY[1] - p[1]
     evx, evy = -_vx_meas_f, -_vy_meas_f
-
-    if abs(ex) < XY_ERR_DB and abs(_vx_meas_f) < XY_VEL_DB:
-        vx_raw = 0.0
-    else:
-        vx_raw = KP_XY * ex + KD_XY * evx
-
-    if abs(ey) < XY_ERR_DB and abs(_vy_meas_f) < XY_VEL_DB:
-        vy_raw = 0.0
-    else:
-        vy_raw = KP_XY * ey + KD_XY * evy
-
+    vx_raw = 0.0 if (abs(ex) < XY_ERR_DB and abs(_vx_meas_f) < XY_VEL_DB) else (KP_XY*ex + KD_XY*evx)
+    vy_raw = 0.0 if (abs(ey) < XY_ERR_DB and abs(_vy_meas_f) < XY_VEL_DB) else (KP_XY*ey + KD_XY*evy)
     vx_raw = _clamp(vx_raw, -VEL_CLAMP_XY, VEL_CLAMP_XY)
     vy_raw = _clamp(vy_raw, -VEL_CLAMP_XY, VEL_CLAMP_XY)
+    _vx_cmd_s = (1.0 - SMOOTH_XY)*_vx_cmd_s + SMOOTH_XY*vx_raw
+    _vy_cmd_s = (1.0 - SMOOTH_XY)*_vy_cmd_s + SMOOTH_XY*vy_raw
 
-    _vx_cmd_s = (1.0 - SMOOTH_XY) * _vx_cmd_s + SMOOTH_XY * vx_raw
-    _vy_cmd_s = (1.0 - SMOOTH_XY) * _vy_cmd_s + SMOOTH_XY * vy_raw
-
-    # Command linear velocity (carb.Float3; no extra bool)
     dc.set_rigid_body_linear_velocity(_body_handle, carb.Float3(_vx_cmd_s, _vy_cmd_s, _vz_cmd_s))
 
+# ---------- UDP JSON listener ----------
+def _udp_loop():
+    global TARGET_POS_XY, TARGET_ALT_Z, _udp_sock, _udp_stop, _last_rx_print
+    print(f"[UDP] Listening on {UDP_HOST}:{UDP_PORT} ...", flush=True)
+    while not _udp_stop:
+        try:
+            data, addr = _udp_sock.recvfrom(8192)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            if not _udp_stop:
+                print("[UDP] recv error:", e, flush=True)
+            continue
+        try:
+            msg = json.loads(data.decode("utf-8", "ignore"))
+        except Exception:
+            # allow newline-delimited JSON bursts
+            for line in data.splitlines():
+                try:
+                    msg = json.loads(line.decode("utf-8", "ignore") if isinstance(line, bytes) else line)
+                except Exception:
+                    continue
+                _handle_json(msg)
+            continue
+        _handle_json(msg)
+
+def _handle_json(msg: dict):
+    global TARGET_POS_XY, TARGET_ALT_Z, _last_rx_print
+    cmd = str(msg.get("cmd", "")).lower()
+    if cmd == "setpos":
+        x  = float(msg.get("x", TARGET_POS_XY[0]))
+        y  = float(msg.get("y", TARGET_POS_XY[1]))
+        alt= float(msg.get("alt", TARGET_ALT_Z))
+        TARGET_POS_XY = Gf.Vec2d(x, y)
+        TARGET_ALT_Z  = alt
+        _throttled_print(f"[UDP RX] setpos → x={x:.2f} y={y:.2f} alt={alt:.2f}")
+    elif cmd == "nudge":
+        dx = float(msg.get("dx", 0.0))
+        dy = float(msg.get("dy", 0.0))
+        da = float(msg.get("dalt", 0.0))
+        TARGET_POS_XY = Gf.Vec2d(TARGET_POS_XY[0] + dx, TARGET_POS_XY[1] + dy)
+        TARGET_ALT_Z  = TARGET_ALT_Z + da
+        _throttled_print(f"[UDP RX] nudge → x={TARGET_POS_XY[0]:.2f} y={TARGET_POS_XY[1]:.2f} alt={TARGET_ALT_Z:.2f}")
+    else:
+        _throttled_print(f"[UDP RX] unknown cmd: {cmd}")
+
+def _throttled_print(s: str):
+    global _last_rx_print
+    if not VERBOSE_RX: return
+    now = time.time()
+    if now - _last_rx_print >= RX_PRINT_PERIOD:
+        print(s, flush=True)
+        _last_rx_print = now
+
+def start_udp():
+    global _udp_sock, _udp_thread, _udp_stop
+    if _udp_thread is not None:
+        print("[UDP] already running", flush=True); return
+    _udp_stop = False
+    _udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _udp_sock.bind((UDP_HOST, UDP_PORT))
+    _udp_sock.settimeout(0.1)
+    _udp_thread = threading.Thread(target=_udp_loop, daemon=True)
+    _udp_thread.start()
+
+def stop_udp():
+    global _udp_sock, _udp_thread, _udp_stop
+    _udp_stop = True
+    if _udp_sock:
+        try: _udp_sock.close()
+        except Exception: pass
+        _udp_sock = None
+    if _udp_thread:
+        _udp_thread.join(timeout=1.0)
+        _udp_thread = None
+    print("[UDP] stopped", flush=True)
+
+# ---------- Lifecycle ----------
 def start():
-    """Run fix phase, then attach hover to existing body."""
+    """Attach controller to existing Iris and start UDP listener."""
     global _body_path, _body_handle, _update_sub
-    body_prim = fix_collisions_and_mass()
+
+    iris_root = _get_prim(IRIS_ROOT_PATH)
+    if iris_root is None:
+        print(f"[Iris] Prim not found at {IRIS_ROOT_PATH}. Update IRIS_ROOT_PATH.", flush=True); return
+
+    body_prim = _find_body_prim(iris_root)
     if body_prim is None:
-        return
+        print("[Iris] No RigidBody found under Iris.", flush=True); return
 
     _body_path = body_prim.GetPath().pathString
-    _body_handle = None  # lazy acquire
+    _body_handle = None
+
+    if APPLY_BODY_CONVEX_FIX:
+        _optional_fix_body_convex(body_prim)
+
+    _apply_damping(body_prim)
 
     if _update_sub is None:
         _update_sub = _app.get_update_event_stream().create_subscription_to_pop(
-            _on_update, name="IrisHoverUpdateExisting"
+            _on_update, name="IrisHoverUpdate_UDP"
         )
+
+    start_udp()
 
     if not _timeline.is_playing():
         _timeline.play()
 
-    print(f"[Iris] Hover controller attached to {_body_path}. Use stop() to detach.")
+    print(f"[Iris] Hover attached to {_body_path}. UDP on {UDP_HOST}:{UDP_PORT}.", flush=True)
 
 def stop():
-    """Detach controller (does not delete or move your prim)."""
+    """Detach controller and stop UDP listener."""
     global _update_sub, _body_handle
     if _update_sub is not None:
         _update_sub.unsubscribe()
         _update_sub = None
     _body_handle = None
-    print("[Iris] Hover controller stopped.")
+    stop_udp()
+    print("[Iris] Hover controller stopped.", flush=True)
 
-# --- Run ---
+# Auto-start
 start()
-

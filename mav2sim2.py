@@ -1,5 +1,5 @@
-# udp_setpos_gui.py — GUI לשליחת סט-פוינטים/דחיפות ל-Isaac Sim ב-UDP JSON, כולל YAW
-# Usage: python udp_setpos_gui.py
+# udp_setpos_gui_yaw.py — GUI לשליחת סט-פוינטים/דחיפות ל-Isaac Sim ב-UDP JSON, כולל YAW
+# Usage: python udp_setpos_gui_yaw.py
 
 import socket, json, tkinter as tk
 from tkinter import ttk
@@ -53,6 +53,9 @@ status_lbl.grid(row=0, column=0, columnspan=8, sticky="ew", padx=8, pady=(8,4))
 
 # בחירת מצב: setpos / nudge
 mode_var = tk.StringVar(value=MODE_SET)
+def _refresh_status():
+    status_var.set(f"Mode: {mode_var.get()} | x={cur_x:.2f}  y={cur_y:.2f}  alt={cur_alt:.2f}  yaw={cur_yaw_deg:.1f}°")
+
 def on_mode_change():
     global mode
     mode = mode_var.get()
@@ -82,10 +85,7 @@ ttk.Entry(steps_frame, textvariable=yaw_step_var, width=7).grid(row=0, column=5)
 def on_alt_slider(val):
     global cur_alt
     cur_alt = float(val)
-    if mode == MODE_SET:
-        send_setpos(cur_x, cur_y, cur_alt, cur_yaw_deg)
-    else:
-        send_setpos(cur_x, cur_y, cur_alt, cur_yaw_deg)  # עדיף ליישר ב-setpos
+    send_setpos(cur_x, cur_y, cur_alt, cur_yaw_deg)
     _refresh_status()
 
 alt_slider = ttk.Scale(root, from_=6.0, to=0.0, orient="vertical", command=on_alt_slider, length=220)
@@ -171,7 +171,7 @@ def do_goto():
 
 ttk.Button(goto_frame, text="Go!", command=do_goto).grid(row=0, column=8, padx=8)
 
-# Grid buttons layout
+# פריסת כפתורים
 ttk.Button(root, text="⬆️ קדימה", command=lambda: do_move("forward")).grid(row=3, column=2, columnspan=2, sticky="ew", pady=4)
 ttk.Button(root, text="⬅️ שמאלה", command=lambda: do_move("left")).grid(row=4, column=2, sticky="ew", padx=4, pady=4)
 ttk.Button(root, text="➡️ ימינה", command=lambda: do_move("right")).grid(row=4, column=3, sticky="ew", padx=4, pady=4)
@@ -183,15 +183,15 @@ ttk.Button(root, text="↻ Yaw Right", command=lambda: do_yaw("right")).grid(row
 ttk.Button(root, text="⬆️ Alt+", command=lambda: do_alt("up")).grid(row=7, column=2, sticky="ew", padx=4, pady=4)
 ttk.Button(root, text="⬇️ Alt-", command=lambda: do_alt("down")).grid(row=7, column=3, sticky="ew", padx=4, pady=4)
 
-ttk.Button(root, text="🔁 אפס XY", command=lambda: _reset_xy()).grid(row=6, column=5, columnspan=2, sticky="ew", padx=8, pady=4)
-
 def _reset_xy():
     global cur_x, cur_y
     cur_x, cur_y = 0.0, 0.0
     send_setpos(cur_x, cur_y, cur_alt, cur_yaw_deg)
     _refresh_status()
 
-# קיצורי מקלדת: WASD לתנועה, Q/E לגובה, Z/C ל-YAW
+ttk.Button(root, text="🔁 אפס XY", command=_reset_xy).grid(row=6, column=5, columnspan=2, sticky="ew", padx=8, pady=4)
+
+# קיצורי מקלדת: WASD, Q/E גובה, Z/C YAW
 def on_key(event):
     k = event.keysym.lower()
     if k == "w": do_move("forward")
@@ -205,10 +205,7 @@ def on_key(event):
 
 root.bind("<Key>", on_key)
 
-def _refresh_status():
-    status_var.set(f"Mode: {mode} | x={cur_x:.2f}  y={cur_y:.2f}  alt={cur_alt:.2f}  yaw={cur_yaw_deg:.1f}°")
-
-# שליחת סט-פוינט התחלתי
+# שליחת סט-פוינט פתיחה
 send_setpos(cur_x, cur_y, cur_alt, cur_yaw_deg)
 _refresh_status()
 
