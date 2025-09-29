@@ -7,7 +7,7 @@ Fake RC Sticks GUI + PS4 Joystick (COM14 @115200)
 - שליטה גם על CH5 ו-CH7 (סרוואים)
 - ARM/DISARM גם דרך כפתורי PS4 (Cross=ARM, Circle=DISARM)
 - מציג מתח/זרם/אחוז סוללה ב-GUI
-- מנסה להתחבר מחדש לשלט PS4 אם לא מחובר או מתנתק
+- חיבור לשלט PS4 מתבצע בהתחלה בלבד (כמו בקוד הפשוט שלך)
 """
 
 import time, threading, tkinter as tk
@@ -33,17 +33,21 @@ class FakeSticks:
         try:
             self.m = mavutil.mavlink_connection(DEVICE, baud=BAUD)
             self.m.wait_heartbeat(timeout=5)
-            ttk.Label(root, text=f"Connected: sys "
-                      f"{self.m.target_system}, comp {self.m.target_component}").pack()
+            ttk.Label(root, text=f"Connected: sys {self.m.target_system}, comp {self.m.target_component}").pack()
         except Exception as e:
             messagebox.showerror("MAVLink", f"Connect failed: {e}")
             root.destroy(); return
 
-        # Init pygame
+        # Init pygame joystick – רק בהתחלה
         pygame.init()
         pygame.joystick.init()
-        self.js = None
-        self._try_connect_joystick()
+        if pygame.joystick.get_count() > 0:
+            self.js = pygame.joystick.Joystick(0)
+            self.js.init()
+            print(f"[PS4] Connected: {self.js.get_name()}")
+        else:
+            self.js = None
+            print("[PS4] No joystick detected")
 
         # RC sticks
         self.roll  = tk.IntVar(value=RC_MID)
@@ -86,14 +90,10 @@ class FakeSticks:
 
         # Buttons
         btns = ttk.Frame(root, padding=8); btns.pack(fill="x")
-        ttk.Button(btns,text="Force ARM", command=self.force_arm).pack(
-            side="left",expand=True,fill="x",padx=4)
-        ttk.Button(btns,text="DISARM",    command=self.disarm).pack(
-            side="left",expand=True,fill="x",padx=4)
-        ttk.Button(btns,text="Reset All", command=self.reset_all).pack(
-            side="left",expand=True,fill="x",padx=4)
-        ttk.Button(btns,text="Exit",      command=self.on_close).pack(
-            side="left",expand=True,fill="x",padx=4)
+        ttk.Button(btns,text="Force ARM", command=self.force_arm).pack(side="left",expand=True,fill="x",padx=4)
+        ttk.Button(btns,text="DISARM",    command=self.disarm).pack(side="left",expand=True,fill="x",padx=4)
+        ttk.Button(btns,text="Reset All", command=self.reset_all).pack(side="left",expand=True,fill="x",padx=4)
+        ttk.Button(btns,text="Exit",      command=self.on_close).pack(side="left",expand=True,fill="x",padx=4)
 
         # Thread
         self.running = True
@@ -112,17 +112,6 @@ class FakeSticks:
         ttk.Button(row,text="Reset",
                    command=lambda v=var,rv=reset_val: v.set(rv)).pack(side="left",padx=4)
 
-    def _try_connect_joystick(self):
-        pygame.joystick.quit()
-        pygame.joystick.init()
-        if pygame.joystick.get_count() > 0:
-            self.js = pygame.joystick.Joystick(0)
-            self.js.init()
-            print(f"[PS4] Connected: {self.js.get_name()}")
-        else:
-            self.js = None
-            print("[PS4] No joystick detected")
-
     def _send_override(self):
         try:
             self.m.mav.rc_channels_override_send(
@@ -140,8 +129,7 @@ class FakeSticks:
             print("[RC_OVERRIDE] error:", e)
 
     def _poll_battery(self):
-        msg = self.m.recv_match(
-            type=["SYS_STATUS","BATTERY_STATUS"], blocking=False)
+        msg = self.m.recv_match(type=["SYS_STATUS","BATTERY_STATUS"], blocking=False)
         if not msg: return
         if msg.get_type() == "SYS_STATUS":
             voltage = msg.voltage_battery / 1000.0
@@ -158,13 +146,8 @@ class FakeSticks:
 
     def _send_loop(self):
         per=1.0/SEND_HZ
-        last_js_check = time.time()
         while self.running:
-            # נסה להתחבר שוב לשלט כל 5 שניות אם לא מחובר
-            if self.js is None and time.time()-last_js_check > 5:
-                self._try_connect_joystick()
-                last_js_check = time.time()
-
+            # --- קריאת ערכים מהשלט PS4 אם קיים ---
             if self.js:
                 try:
                     pygame.event.pump()
@@ -190,10 +173,9 @@ class FakeSticks:
                     if self.js.get_button(0): self.force_arm()
                     if self.js.get_button(1): self.disarm()
                 except Exception as e:
-                    print("[PS4] joystick lost:", e)
-                    self.js = None
-                    last_js_check = time.time()
-
+                    print("[PS4] joystick error:", e)
+                    self.js = None  # מתנתק → לא ננסה reconnect
+            # --- שליחה ל־MAVLink + עדכון סוללה ---
             self._send_override()
             self._poll_battery()
             time.sleep(per)
