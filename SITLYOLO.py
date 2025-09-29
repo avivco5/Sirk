@@ -72,6 +72,7 @@ def yolo_control():
                 if int(box.cls[0].item()) == 0:  # class 0 = person
                     detected = True
                     x1, y1, x2, y2 = box.xyxy[0]
+                    print(x1, y1, x2, y2 )
                     cx = (x1 + x2) / 2
                     box_h = y2 - y1  # גובה התיבה
 

@@ -2,7 +2,7 @@ from pymavlink import mavutil
 from pynput import keyboard
 import time
 
-# Connect to ArduPilot via COM19 (Windows)
+# Connect to ArduPilot via COM19 (Windows)'דדדדדדד
 master = mavutil.mavlink_connection('COM14', baud=115200)
 
 # Wait for heartbeat (to ensure connection is alive)
