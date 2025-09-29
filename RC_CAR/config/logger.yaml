@@ -1,0 +1,56 @@
+# log level
+#
+# type: enum
+# value: trace, debug, info, warn, error, critical
+# default: info (if 'log_level' not exist or error)
+log_level: info
+
+# log file number
+#
+# type: int
+# default: 5 (if `log_file_number` not exist, or zero)
+log_file_number: 5
+
+# log file size
+#
+# type: int
+# units: KB, MB, GB
+# default: 5MB (if 'log_fise_size' not exist, or zero)
+log_file_size: 5MB
+
+# log console output
+#
+# type: bool
+# value: false, no console; true, output to console
+# default: false
+log_to_console: true
+
+# path for storing log files
+#
+# type: string
+# if `log_save_path` not exist, or no write attribute, no log will be generated
+# log_file_name = log_save_path + "/" + process_name + ".log"
+log_save_path: /run/media/mmcblk0p3/payload_log
+
+# Format mark:
+#
+# - %v: log data            - %C: brief year           - %H: hour(0~24)
+# - %n: log name            - %Y: entire year          - %I: hout(0~11)
+# - %t: thread ID           - %b: brief month          - %M: minute
+# - %P: process ID          - %B: entire month         - %S: second
+# - %l: entire level        - %m: month                - %e: msecond(0~999)
+# - %L: brief level         - %d: day                  - %f: usecond(0~999999)
+# - %a: brief week          - %+: default format       - %F: nsecond(0~999999999)
+# - %A: entire week         - %!: function name        - %p: AM or PM, with %I
+# - %^: color start         - %s: file name            - %x or %D: brief date, e.g. '05/15/19'
+# - %$: color stop          - %g: full file name       - %r: 0~12 time, e.g. '01:44:32 PM'
+# - %%: output '%'          - %#: file line            - %R: 0~24 time, e.g. '23:55'
+# - %@: file name and line  - %E: seconds since epoch  - %z: Gmt Offset, e.g '+02:00'
+# - %T or %X: standard time, e.g '23:55:25'
+#
+# Here are some common formats
+# - "[%Y-%m-%d %H:%M:%S.%e] [%^-%L-%$] [%s:%# %!()] : %v"
+# - "[%Y-%m-%d %H:%M:%S.%F] [%^-%L-%$] [%s:%# %!()] : %v"
+# - "[%Y-%m-%d %H:%M:%S.%F] [%^-%L-%$] [%g:%# %!()] : %v"
+# - "[%Y-%m-%d %H:%M:%S.%F] [%^-%L-%$] [%g:%# %!()] [tid:%t] : %v"
+log_format: "[%Y-%m-%d %H:%M:%S.%e] [%^-%L-%$] [%s:%# %!()] : %v"
