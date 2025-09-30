@@ -3,9 +3,12 @@
 """
 Fake RC Sticks GUI + PS4 Joystick (COM14 @115200)
 - GUI סליידרים + שלט PS4
+- Throttle (CH3): חצי עליון בלבד + Deadzone
+- שליטה גם על CH5 ו-CH7 (סרוואים)
+- ARM/DISARM גם דרך כפתורי PS4 (Cross=ARM, Circle=DISARM)
+- מציג סוללה + Telemetry: Alt, Yaw, Dist-to-WP, Dist-to-Home, GroundSpeed, 3D Speed
 - YOLO Person tracking → שומר אדם במרכז ע"י שינוי YAW בלבד (CH4) + Throttle מינימלי למיקס
 - ALT_HOLD (ברומטר) + כפתורי ▲ +0.1m / ▼ -0.1m לשינוי גובה יעד
-- טלמטריה: Alt (יחסי, יציב), Yaw, Dist-to-WP, Dist-to-Home, GroundSpeed, 3D Speed
 """
 
 import math, time, threading, tkinter as tk
@@ -24,23 +27,23 @@ except Exception as _e:
     cv2 = None
     print("⚠️ YOLO/Camera unavailable:", _e)
 
-# ==== תצורה ====
+# ==== תצורה כללית ====
 DEVICE = "COM14"
 BAUD   = 115200
 RC_MIN, RC_MAX, RC_MID = 1000, 2000, 1500
 SEND_HZ = 20.0
 DEADZONE = 0.1
 
-# YOLO (Yaw בלבד)
+# ==== תצורת YOLO (YAW בלבד) ====
 YOLO_DB_PIX = 40
 YOLO_YAW_GAIN = 0.6
-YOLO_THR_MIN = 1150
+YOLO_THR_MIN = 1350
 YOLO_SHOW_WINDOW = True
 YOLO_CAM_INDEX = 0
 YOLO_MODEL_NAME = "yolov8n.pt"
 YOLO_PERSON_CLS = 0
 
-# ALT_HOLD
+# ==== קפיצות גובה ב-ALT_HOLD ====
 ALT_BUMP_DEFAULT = 0.1
 ALT_BUMP_FRAC = 0.30
 ALT_BUMP_MIN_T = 0.08
@@ -48,13 +51,11 @@ ALT_BUMP_MAX_T = 1.00
 FALLBACK_SPEED_UP = 1.5
 FALLBACK_SPEED_DN = 1.0
 
-# Altitude source hold time to avoid flicker (sec)
-ALT_SOURCE_HOLD_S = 1.5
-
 def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
 def apply_deadzone(val, dz=DEADZONE): return 0.0 if abs(val) < dz else val
 
 def haversine_m(lat1, lon1, lat2, lon2):
+    """distance meters בין שתי נקודות GPS בדגריז"""
     R = 6371000.0
     a1, b1 = math.radians(lat1), math.radians(lon1)
     a2, b2 = math.radians(lat2), math.radians(lon2)
@@ -72,27 +73,11 @@ class FakeSticks:
             self.m = mavutil.mavlink_connection(DEVICE, baud=BAUD)
             self.m.wait_heartbeat(timeout=5)
             ttk.Label(root, text=f"Connected: sys {self.m.target_system}, comp {self.m.target_component}").pack()
-
-            # בקשת HOME
-            try:
-                self.m.mav.command_long_send(
-                    self.m.target_system, self.m.target_component,
-                    mavutil.mavlink.MAV_CMD_GET_HOME_POSITION, 0,
-                    0,0,0,0,0,0,0
-                )
-            except Exception:
-                pass
-
-            # בקשת קצבי הודעות קבועים
-            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ALTITUDE,            10)  # 141
-            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 10)  # 33
-            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD,              5)  # 74
-            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,           1)  # 1
         except Exception as e:
             messagebox.showerror("MAVLink", f"Connect failed: {e}")
             root.destroy(); return
 
-        # Init pygame joystick
+        # Init pygame joystick – רק בהתחלה
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() > 0:
@@ -107,68 +92,69 @@ class FakeSticks:
         self.thr   = tk.IntVar(value=RC_MIN)
         self.yaw   = tk.IntVar(value=RC_MID)
 
-        # Servo
+        # Servo vars
         self.servo5 = tk.IntVar(value=1500)
         self.servo7 = tk.IntVar(value=1500)
 
-        # Battery
+        # Battery vars
         self.batt_v   = tk.StringVar(value="--.- V")
         self.batt_a   = tk.StringVar(value="--.- A")
         self.batt_pct = tk.StringVar(value="-- %")
 
-        # Telemetry (with proper defaults)
-        self.t_alt      = tk.StringVar(value="--")
-        self.t_yaw      = tk.StringVar(value="--")
-        self.t_wpdist   = tk.StringVar(value="--")
-        self.t_disthome = tk.StringVar(value="--")
-        self.t_gspeed   = tk.StringVar(value="--")
-        self.t_speed3d  = tk.StringVar(value="--")
+        # Telemetry vars (מציגים כמו במיסשן פלנר)
+        self.t_alt     = tk.StringVar(value="0.00")
+        self.t_yaw     = tk.StringVar(value="0.00")
+        self.t_wpdist  = tk.StringVar(value="0.00")
+        self.t_disthome= tk.StringVar(value="0.00")
+        self.t_gspeed  = tk.StringVar(value="0.00")
+        self.t_speed3d = tk.StringVar(value="0.00")
 
-        # GPS/home state
-        self._cur_latlon  = None
+        # מצב GPS להערכת מרחקים
+        self._cur_latlon = None
         self._home_latlon = None
 
-        # Altitude source state (to avoid flicker)
-        self._alt_src   = None           # 'ALTITUDE' / 'GPI' / 'VFR'
-        self._alt_ts    = 0.0            # last update time
-        self._alt_val   = None           # last numeric value
-        self._priority  = {'VFR':1, 'GPI':2, 'ALTITUDE':3}
-
-        # ---------- GUI ----------
+        # RC sliders
         lf = ttk.LabelFrame(root, text="RC Sticks", padding=8); lf.pack(fill="x", padx=8, pady=6)
         self._mk_slider(lf,"Roll (CH1)", self.roll, RC_MID)
         self._mk_slider(lf,"Pitch (CH2)",self.pitch,RC_MID)
         self._mk_slider(lf,"Throttle (CH3)",self.thr,RC_MIN)
         self._mk_slider(lf,"Yaw (CH4)",   self.yaw,RC_MID)
 
+        # Servo sliders
         ls = ttk.LabelFrame(root, text="Servos (CH5 & CH7)", padding=8); ls.pack(fill="x", padx=8, pady=6)
         self._mk_slider(ls,"Servo CH5", self.servo5, 1500)
         self._mk_slider(ls,"Servo CH7", self.servo7, 1500)
 
+        # Battery info
         lb = ttk.LabelFrame(root, text="Battery", padding=8); lb.pack(fill="x", padx=8, pady=6)
         ttk.Label(lb, text="Voltage:").grid(row=0,column=0,sticky="w"); ttk.Label(lb, textvariable=self.batt_v).grid(row=0,column=1,sticky="w")
         ttk.Label(lb, text="Current:").grid(row=1,column=0,sticky="w"); ttk.Label(lb, textvariable=self.batt_a).grid(row=1,column=1,sticky="w")
         ttk.Label(lb, text="Remaining:").grid(row=2,column=0,sticky="w"); ttk.Label(lb, textvariable=self.batt_pct).grid(row=2,column=1,sticky="w")
 
+        # Telemetry panel (big digits)
         tele = ttk.LabelFrame(root, text="Telemetry", padding=8); tele.pack(fill="x", padx=8, pady=6)
-        self._mk_big(tele, 0, 0, "Altitude (m)",     self.t_alt)
-        self._mk_big(tele, 0, 1, "GroundSpeed (m/s)",self.t_gspeed)
-        self._mk_big(tele, 1, 0, "Dist to WP (m)",   self.t_wpdist)
-        self._mk_big(tele, 1, 1, "Yaw (deg)",        self.t_yaw)
-        self._mk_big(tele, 2, 0, "3D Speed (m/s)",   self.t_speed3d)
-        self._mk_big(tele, 2, 1, "DistToHome (m)",   self.t_disthome)
+        self._mk_big(tele, 0, 0, "Altitude (m)",  self.t_alt)
+        self._mk_big(tele, 0, 1, "GroundSpeed (m/s)", self.t_gspeed)
+        self._mk_big(tele, 1, 0, "Dist to WP (m)", self.t_wpdist)
+        self._mk_big(tele, 1, 1, "Yaw (deg)",      self.t_yaw)
+        self._mk_big(tele, 2, 0, "3D Speed (m/s)", self.t_speed3d)
+        self._mk_big(tele, 2, 1, "DistToHome (m)", self.t_disthome)
 
+        # YOLO controls
         ly = ttk.LabelFrame(root, text="YOLO Yaw Tracking", padding=8); ly.pack(fill="x", padx=8, pady=6)
-        self.yolo_enabled = False; self.yolo_status = tk.StringVar(value="YOLO: ready" if YOLO_OK else "YOLO: unavailable")
+        self.yolo_enabled = False; self.yolo_thread = None
+        self.yolo_status  = tk.StringVar(value="YOLO: ready" if YOLO_OK else "YOLO: unavailable")
         ttk.Label(ly, textvariable=self.yolo_status).pack(side="left", padx=4)
         ttk.Button(ly, text="▶ Start", command=self.start_yolo).pack(side="left", padx=4)
         ttk.Button(ly, text="⏹ Stop",  command=self.stop_yolo).pack(side="left", padx=4)
 
+        # ALT HOLD controls
         lm = ttk.LabelFrame(root, text="Altitude (Baro / ALT_HOLD)", padding=8); lm.pack(fill="x", padx=8, pady=6)
         ttk.Button(lm, text="Hold Alt (ALT_HOLD)", command=self.hold_alt).pack(side="left", expand=True, fill="x", padx=4)
         ttk.Button(lm, text="▲ +0.1 m", command=lambda: self.bump_alt(+ALT_BUMP_DEFAULT)).pack(side="left", expand=True, fill="x", padx=4)
         ttk.Button(lm, text="▼ -0.1 m", command=lambda: self.bump_alt(-ALT_BUMP_DEFAULT)).pack(side="left", expand=True, fill="x", padx=4)
 
+        # Action buttons
         btns = ttk.Frame(root, padding=8); btns.pack(fill="x")
         ttk.Button(btns,text="Force ARM", command=self.force_arm).pack(side="left",expand=True,fill="x",padx=4)
         ttk.Button(btns,text="DISARM",    command=self.disarm).pack(side="left",expand=True,fill="x",padx=4)
@@ -177,24 +163,13 @@ class FakeSticks:
 
         # Threads
         self.running = True
-        threading.Thread(target=self._send_loop,     daemon=True).start()
-        threading.Thread(target=self._mav_telemetry, daemon=True).start()
+        threading.Thread(target=self._send_loop,      daemon=True).start()
+        threading.Thread(target=self._mav_telemetry,  daemon=True).start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.geometry("880x820")
+        self.root.geometry("840x780")
 
-    # ---------- helpers ----------
-    def _set_msg_rate(self, msgid, hz):
-        try:
-            interval_us = int(1e6 / float(hz)) if hz > 0 else 0
-            self.m.mav.command_long_send(
-                self.m.target_system, self.m.target_component,
-                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                0, msgid, interval_us, 0,0,0,0,0
-            )
-        except Exception as e:
-            print(f"[MSG_RATE] {msgid} @ {hz}Hz failed:", e)
-
+    # ---------- GUI helpers ----------
     def _mk_slider(self,parent,label,var,reset_val):
         row=ttk.Frame(parent); row.pack(fill="x", pady=4)
         ttk.Label(row,text=label,width=12).pack(side="left")
@@ -211,7 +186,7 @@ class FakeSticks:
         lbl.pack(fill="both", expand=True, padx=4, pady=4)
         lbl.configure(font=("Segoe UI", 36, "bold"))
 
-    # ---------- RC override ----------
+    # ---------- MAVLink helpers ----------
     def _send_override(self):
         try:
             self.m.mav.rc_channels_override_send(
@@ -227,6 +202,18 @@ class FakeSticks:
             )
         except Exception as e:
             print("[RC_OVERRIDE] error:", e)
+
+    def _poll_battery(self, msg):
+        if msg.get_type() == "SYS_STATUS":
+            voltage = msg.voltage_battery / 1000.0
+            current = msg.current_battery / 100.0
+            remaining = msg.battery_remaining
+            self.batt_v.set(f"{voltage:.1f} V")
+            if current > -9000: self.batt_a.set(f"{current:.1f} A")
+            if remaining >= 0:  self.batt_pct.set(f"{remaining} %")
+        elif msg.get_type() == "BATTERY_STATUS":
+            if len(msg.voltages) > 0 and msg.voltages[0] > 0:
+                self.batt_v.set(f"{msg.voltages[0]/1000.0:.1f} V")
 
     def set_mode(self, mode_name):
         try:
@@ -265,22 +252,25 @@ class FakeSticks:
         steps, cur = 10, self.thr.get()
         for i in range(1, steps+1):
             self.thr.set(int(cur + (rc3_hover - cur) * i/steps))
-            self._send_override(); time.sleep(0.03)
+            self._send_override()
+            time.sleep(0.03)
         print(f"[ALT_HOLD] Hover={hover:.2f} → RC3={rc3_hover}")
 
     def bump_alt(self, delta_m):
         up = self.get_param("PILOT_SPEED_UP", default=None)
         dn = self.get_param("PILOT_SPEED_DN", default=None)
-        def _as_mps(val, fb): return (val/100.0 if (val and val>20) else (val if val else fb))
+        def _as_mps(val, fallback): return (val/100.0 if (val and val>20) else (val if val else fallback))
         v_up, v_dn = _as_mps(up, FALLBACK_SPEED_UP), _as_mps(dn, FALLBACK_SPEED_DN)
         rc3_hover, _ = self._hover_rc()
         sign = 1 if delta_m >= 0 else -1
         rate = v_up if sign>0 else v_dn
         frac = ALT_BUMP_FRAC
-        dur = clamp(abs(delta_m) / max(rate*frac, 1e-3), ALT_BUMP_MIN_T, ALT_BUMP_MAX_T)
+        dur = abs(delta_m) / max(rate*frac, 1e-3)
+        dur = clamp(dur, ALT_BUMP_MIN_T, ALT_BUMP_MAX_T)
         rc_pulse = clamp(rc3_hover + sign*int(500*frac), RC_MIN, RC_MAX)
         def _do():
             self.set_mode("ALT_HOLD")
+            prev = self.thr.get()
             self.thr.set(rc_pulse)
             t_end = time.time()+dur
             while time.time()<t_end and self.running:
@@ -289,7 +279,7 @@ class FakeSticks:
             print(f"[ALT_BUMP] Δh={delta_m:+.2f}m dur={dur:.2f}s RC3={rc_pulse}")
         threading.Thread(target=_do, daemon=True).start()
 
-    # ---------- TX loop ----------
+    # ---------- Main TX loop ----------
     def _send_loop(self):
         per=1.0/SEND_HZ
         while self.running:
@@ -316,109 +306,72 @@ class FakeSticks:
             self._send_override()
             time.sleep(per)
 
-    # ---------- ALTITUDE UPDATE LOGIC ----------
-    def _consider_alt(self, value, src):
-        """עדכון גובה תוך שמירה על מקור מועדף ללא קפיצות."""
-        if value is None: return
-        try:
-            val = float(value)
-        except Exception:
-            return
-        now = time.time()
-        cur_pri = self._priority.get(self._alt_src or '', 0)
-        new_pri = self._priority.get(src, 0)
-
-        # אל תוריד עדיפות אם יש ערך טרי ממקור חזק בשלוש השניות האחרונות
-        if new_pri < cur_pri and (now - self._alt_ts) < ALT_SOURCE_HOLD_S:
-            return
-
-        self._alt_src = src
-        self._alt_ts  = now
-        self._alt_val = val
-        self.t_alt.set(f"{val:.2f}")
-
-    # ---------- Telemetry RX ----------
+    # ---------- MAV Telemetry reader ----------
     def _mav_telemetry(self):
+        last_att_yaw = None
         while self.running:
             try:
-                msg = self.m.recv_match(blocking=False)
+                msg = self.m.recv_match(blocking=False, timeout=0.1)
             except Exception:
                 time.sleep(0.01); continue
-            if not msg:
-                time.sleep(0.005); continue
-
+            if not msg: continue
             t = msg.get_type()
 
             # Battery
-            if t == "SYS_STATUS":
-                voltage = msg.voltage_battery / 1000.0
-                current = msg.current_battery / 100.0
-                remaining = msg.battery_remaining
-                self.batt_v.set(f"{voltage:.1f} V")
-                if current > -9000: self.batt_a.set(f"{current:.1f} A")
-                if remaining >= 0:  self.batt_pct.set(f"{remaining} %")
-            elif t == "BATTERY_STATUS":
-                if len(msg.voltages) > 0 and msg.voltages[0] > 0:
-                    self.batt_v.set(f"{msg.voltages[0]/1000.0:.1f} V")
+            if t in ("SYS_STATUS","BATTERY_STATUS"):
+                self._poll_battery(msg)
 
-            # Altitude (עדיפויות)
-            if t == "ALTITUDE":
-                self._consider_alt(getattr(msg, "altitude_relative", None), "ALTITUDE")
+            # VFR_HUD: alt, groundspeed, heading
+            if t == "VFR_HUD":
+                try:
+                    self.t_alt.set(f"{float(msg.alt):.2f}")
+                except Exception: pass
+                try:
+                    self.t_gspeed.set(f"{float(msg.groundspeed):.2f}")
+                except Exception: pass
+                try:
+                    self.t_yaw.set(f"{float(msg.heading):.2f}")
+                except Exception: pass
 
+            # ATTITUDE fallback yaw
+            if t == "ATTITUDE":
+                try:
+                    last_att_yaw = math.degrees(float(msg.yaw))
+                    if self.t_yaw.get() == "0.00":  # אם אין ערך מ-VFR_HUD
+                        self.t_yaw.set(f"{last_att_yaw:.2f}")
+                except Exception: pass
+
+            # GLOBAL_POSITION_INT: מהירותים, lat/lon, alt_rel
             if t == "GLOBAL_POSITION_INT":
-                # 3D speed
                 try:
-                    vx, vy, vz = float(msg.vx)/100.0, float(msg.vy)/100.0, float(msg.vz)/100.0
-                    self.t_speed3d.set(f"{(vx*vx+vy*vy+vz*vz)**0.5:.2f}")
-                except Exception:
-                    pass
-                # Relative alt (mm→m)
-                try:
-                    self._consider_alt(float(msg.relative_alt)/1000.0, "GPI")
-                except Exception:
-                    pass
-                # GPS pos → DistToHome
+                    vx, vy, vz = float(msg.vx)/100.0, float(msg.vy)/100.0, float(msg.vz)/100.0  # m/s
+                    spd3d = math.sqrt(vx*vx + vy*vy + vz*vz)
+                    self.t_speed3d.set(f"{spd3d:.2f}")
+                except Exception: pass
                 try:
                     self._cur_latlon = (msg.lat/1e7, msg.lon/1e7)
-                    if self._home_latlon and all(self._cur_latlon):
+                    if self._home_latlon and self._cur_latlon[0]!=0 and self._cur_latlon[1]!=0:
                         d = haversine_m(self._home_latlon[0], self._home_latlon[1],
-                                        self._cur_latlon[0],  self._cur_latlon[1])
+                                        self._cur_latlon[0], self._cur_latlon[1])
                         self.t_disthome.set(f"{d:.2f}")
-                    else:
-                        self.t_disthome.set("--")
-                except Exception:
-                    self.t_disthome.set("--")
-
-            if t == "VFR_HUD":
-                # Ground speed + yaw
-                try: self.t_gspeed.set(f"{float(msg.groundspeed):.2f}")
                 except Exception: pass
-                try: self.t_yaw.set(f"{float(msg.heading):.2f}")
-                except Exception: pass
-                # גובה (עדיפות אחרונה בלבד, ואם אין מקור חזק טרי)
-                try:
-                    if (time.time() - self._alt_ts) > ALT_SOURCE_HOLD_S:
-                        self._consider_alt(float(msg.alt), "VFR")
-                except Exception:
-                    pass
 
+            # HOME_POSITION: lat/lon בית
             if t == "HOME_POSITION":
                 try:
                     self._home_latlon = (msg.latitude/1e7, msg.longitude/1e7)
-                except Exception:
-                    self._home_latlon = None
+                except Exception: pass
 
+            # NAV_CONTROLLER_OUTPUT: מרחק ל-WP
             if t == "NAV_CONTROLLER_OUTPUT":
                 try:
-                    dwp = float(msg.wp_dist)
-                    self.t_wpdist.set(f"{dwp:.2f}" if dwp > 0 else "--")
-                except Exception:
-                    self.t_wpdist.set("--")
+                    self.t_wpdist.set(f"{float(msg.wp_dist):.2f}")
+                except Exception: pass
 
-    # ---------- YOLO ----------
+    # ---------- YOLO Yaw Tracking ----------
     def start_yolo(self):
         if not YOLO_OK:
-            messagebox.showwarning("YOLO", "YOLO/Camera not available"); return
+            messagebox.showwarning("YOLO", "YOLO/Camera not available (missing packages?)"); return
         if self.yolo_enabled: return
         self.yolo_enabled = True
         self.yolo_status.set("YOLO: running (yaw only)")

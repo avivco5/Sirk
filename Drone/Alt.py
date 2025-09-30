@@ -4,7 +4,7 @@
 Fake RC Sticks GUI + PS4 Joystick (COM14 @115200)
 - GUI סליידרים + שלט PS4
 - YOLO Person tracking → שומר אדם במרכז ע"י שינוי YAW בלבד (CH4) + Throttle מינימלי למיקס
-- ALT_HOLD (ברומטר) + כפתורי ▲ +0.1m / ▼ -0.1m לשינוי גובה יעד
+- ALT_HOLD (ברומטר) + כפתורי ▲ +0.1m / ▼ -0.1m לשינוי גובה יעד (בקר סגור-לולאה נוסף)
 - טלמטריה: Alt (יחסי, יציב), Yaw, Dist-to-WP, Dist-to-Home, GroundSpeed, 3D Speed
 """
 
@@ -40,7 +40,7 @@ YOLO_CAM_INDEX = 0
 YOLO_MODEL_NAME = "yolov8n.pt"
 YOLO_PERSON_CLS = 0
 
-# ALT_HOLD
+# ==== ALT_HOLD – פעולות Pulse (השארתי למקרה שתרצה) ====
 ALT_BUMP_DEFAULT = 0.1
 ALT_BUMP_FRAC = 0.30
 ALT_BUMP_MIN_T = 0.08
@@ -48,8 +48,15 @@ ALT_BUMP_MAX_T = 1.00
 FALLBACK_SPEED_UP = 1.5
 FALLBACK_SPEED_DN = 1.0
 
-# Altitude source hold time to avoid flicker (sec)
+# ==== Altitude source hold כדי להימנע מריצודים ====
 ALT_SOURCE_HOLD_S = 1.5
+
+# === Alt-Hold Controller (סגור-לולאה) ===
+ALT_CTRL_TOL_M        = 0.05      # טווח "נחשב במקום": בתוך זה נשאיר RC3 ב-Hover
+ALT_CTRL_KP_US_PER_M  = 1200.0    # רווח פרופורציונלי: מיקרושניות/מטר (RC3)
+ALT_CTRL_MAX_US       = 300       # סטייה מקסימלית מ-Hover (µs)
+ALT_CTRL_DT           = 0.05      # תקופת הבקר (שניות)
+ALT_CTRL_PRINT_PERIOD = 0.2       # הדפסה לקונסול
 
 def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
 def apply_deadzone(val, dz=DEADZONE): return 0.0 if abs(val) < dz else val
@@ -134,6 +141,12 @@ class FakeSticks:
         self._alt_val   = None           # last numeric value
         self._priority  = {'VFR':1, 'GPI':2, 'ALTITUDE':3}
 
+        # === Alt-Hold Controller state ===
+        self.alt_hold_enabled = False
+        self.alt_hold_thread  = None
+        self.alt_tgt = tk.DoubleVar(value=0.0)
+        self.alt_err = tk.DoubleVar(value=0.0)
+
         # ---------- GUI ----------
         lf = ttk.LabelFrame(root, text="RC Sticks", padding=8); lf.pack(fill="x", padx=8, pady=6)
         self._mk_slider(lf,"Roll (CH1)", self.roll, RC_MID)
@@ -158,16 +171,32 @@ class FakeSticks:
         self._mk_big(tele, 2, 0, "3D Speed (m/s)",   self.t_speed3d)
         self._mk_big(tele, 2, 1, "DistToHome (m)",   self.t_disthome)
 
+        # YOLO
         ly = ttk.LabelFrame(root, text="YOLO Yaw Tracking", padding=8); ly.pack(fill="x", padx=8, pady=6)
         self.yolo_enabled = False; self.yolo_status = tk.StringVar(value="YOLO: ready" if YOLO_OK else "YOLO: unavailable")
         ttk.Label(ly, textvariable=self.yolo_status).pack(side="left", padx=4)
         ttk.Button(ly, text="▶ Start", command=self.start_yolo).pack(side="left", padx=4)
         ttk.Button(ly, text="⏹ Stop",  command=self.stop_yolo).pack(side="left", padx=4)
 
-        lm = ttk.LabelFrame(root, text="Altitude (Baro / ALT_HOLD)", padding=8); lm.pack(fill="x", padx=8, pady=6)
+        # ALT_HOLD (Pulse) – השארתי, אם תרצה להשתמש גם בזה
+        lm = ttk.LabelFrame(root, text="ALT_HOLD (Pulse helper)", padding=8); lm.pack(fill="x", padx=8, pady=6)
         ttk.Button(lm, text="Hold Alt (ALT_HOLD)", command=self.hold_alt).pack(side="left", expand=True, fill="x", padx=4)
-        ttk.Button(lm, text="▲ +0.1 m", command=lambda: self.bump_alt(+ALT_BUMP_DEFAULT)).pack(side="left", expand=True, fill="x", padx=4)
-        ttk.Button(lm, text="▼ -0.1 m", command=lambda: self.bump_alt(-ALT_BUMP_DEFAULT)).pack(side="left", expand=True, fill="x", padx=4)
+        ttk.Button(lm, text="▲ +0.1 m (pulse)", command=lambda: self.bump_alt(+ALT_BUMP_DEFAULT)).pack(side="left", expand=True, fill="x", padx=4)
+        ttk.Button(lm, text="▼ -0.1 m (pulse)", command=lambda: self.bump_alt(-ALT_BUMP_DEFAULT)).pack(side="left", expand=True, fill="x", padx=4)
+
+        # === Alt-Hold Controller (סגור-לולאה) ===
+        lc = ttk.LabelFrame(root, text="Altitude Hold (Controller, baro)", padding=8); lc.pack(fill="x", padx=8, pady=6)
+        ttk.Button(lc, text="Start Alt-Hold (CTRL)", command=self.start_alt_hold_ctrl).pack(side="left", expand=True, fill="x", padx=4)
+        ttk.Button(lc, text="▲ +0.1 m", command=lambda: self.bump_target(+0.1)).pack(side="left", expand=True, fill="x", padx=4)
+        ttk.Button(lc, text="▼ −0.1 m", command=lambda: self.bump_target(-0.1)).pack(side="left", expand=True, fill="x", padx=4)
+        ttk.Button(lc, text="Stop", command=self.stop_alt_hold_ctrl).pack(side="left", expand=True, fill="x", padx=4)
+
+        # שורת סטטוס יעד/שגיאה
+        row = ttk.Frame(lc, padding=6); row.pack(fill="x", padx=4)
+        ttk.Label(row, text="Target (m):").pack(side="left")
+        ttk.Label(row, textvariable=self.alt_tgt, width=8).pack(side="left", padx=(0,12))
+        ttk.Label(row, text="Error (m):").pack(side="left")
+        ttk.Label(row, textvariable=self.alt_err, width=8).pack(side="left")
 
         btns = ttk.Frame(root, padding=8); btns.pack(fill="x")
         ttk.Button(btns,text="Force ARM", command=self.force_arm).pack(side="left",expand=True,fill="x",padx=4)
@@ -181,7 +210,7 @@ class FakeSticks:
         threading.Thread(target=self._mav_telemetry, daemon=True).start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.geometry("880x820")
+        self.root.geometry("980x880")
 
     # ---------- helpers ----------
     def _set_msg_rate(self, msgid, hz):
@@ -258,7 +287,7 @@ class FakeSticks:
         rc3_hover = int(RC_MIN + hover * (RC_MAX - RC_MIN))
         return rc3_hover, hover
 
-    # ---------- ALT HOLD ----------
+    # ---------- ALT HOLD (Pulse helper הישן) ----------
     def hold_alt(self):
         self.set_mode("ALT_HOLD")
         rc3_hover, hover = self._hover_rc()
@@ -289,6 +318,63 @@ class FakeSticks:
             print(f"[ALT_BUMP] Δh={delta_m:+.2f}m dur={dur:.2f}s RC3={rc_pulse}")
         threading.Thread(target=_do, daemon=True).start()
 
+    # === Alt-Hold Controller (סגור-לולאה) ===
+    def start_alt_hold_ctrl(self):
+        self.set_mode("ALT_HOLD")
+        rc3_hover, _ = self._hover_rc()
+        self.thr.set(rc3_hover)  # נתחיל ב-hover
+        # יעד = הגובה הנוכחי (יחסי), מתוך המסנן שלך
+        tgt = self._alt_val if self._alt_val is not None else 0.0
+        self.alt_tgt.set(round(float(tgt), 2))
+        if self.alt_hold_enabled:
+            print("[ALT-CTRL] already running")
+            return
+        self.alt_hold_enabled = True
+        self.alt_hold_thread = threading.Thread(target=self._alt_hold_loop, daemon=True)
+        self.alt_hold_thread.start()
+        print(f"[ALT-CTRL] started, target={self.alt_tgt.get():.2f} m")
+
+    def stop_alt_hold_ctrl(self):
+        if not self.alt_hold_enabled: return
+        self.alt_hold_enabled = False
+        rc3_hover, _ = self._hover_rc()
+        self.thr.set(rc3_hover)
+        print("[ALT-CTRL] stopped")
+
+    def bump_target(self, delta_m: float):
+        if not self.alt_hold_enabled:
+            self.start_alt_hold_ctrl()
+        self.alt_tgt.set(round(self.alt_tgt.get() + float(delta_m), 2))
+        print(f"[ALT-CTRL] target -> {self.alt_tgt.get():.2f} m")
+
+    def _alt_hold_loop(self):
+        rc3_hover, _ = self._hover_rc()
+        last_print = 0.0
+        while self.running and self.alt_hold_enabled:
+            alt = self._alt_val
+            if alt is None:
+                time.sleep(ALT_CTRL_DT)
+                continue
+            tgt = float(self.alt_tgt.get())
+            err = tgt - float(alt)
+            self.alt_err.set(round(err, 3))
+
+            if abs(err) <= ALT_CTRL_TOL_M:
+                rc3 = rc3_hover
+            else:
+                delta_us = int(err * ALT_CTRL_KP_US_PER_M)
+                delta_us = clamp(delta_us, -ALT_CTRL_MAX_US, ALT_CTRL_MAX_US)
+                rc3 = clamp(rc3_hover + delta_us, RC_MIN, RC_MAX)
+
+            self.thr.set(int(rc3))
+            # הדפסות לקונסול
+            now = time.time()
+            if now - last_print >= ALT_CTRL_PRINT_PERIOD:
+                print(f"[ALT-CTRL] alt={float(alt):.2f} m  tgt={tgt:.2f} m  err={err:.2f} m  rc3={rc3}")
+                last_print = now
+
+            time.sleep(ALT_CTRL_DT)
+
     # ---------- TX loop ----------
     def _send_loop(self):
         per=1.0/SEND_HZ
@@ -304,9 +390,13 @@ class FakeSticks:
                     p = int(RC_MID + axis_pitch * 500)
                     y = int(RC_MID + axis_yaw   * 500)
                     t = RC_MIN if axis_thr <= 0 else int(RC_MIN + axis_thr * (RC_MAX - RC_MIN))
+
+                    # בזמן Alt-CTRL פעיל – לא לגעת ב-THR מהשלט
+                    if not self.alt_hold_enabled:
+                        self.thr.set(clamp(t, RC_MIN, RC_MAX))
+                    # Yaw מהג'ויסטיק אם YOLO כבוי
                     if not self.yolo_enabled:
                         self.yaw.set(clamp(y, RC_MIN, RC_MAX))
-                        self.thr.set(clamp(t, RC_MIN, RC_MAX))
                     self.roll.set(clamp(r, RC_MIN, RC_MAX))
                     self.pitch.set(clamp(p, RC_MIN, RC_MAX))
                     if self.js.get_button(0): self.force_arm()
@@ -328,7 +418,6 @@ class FakeSticks:
         cur_pri = self._priority.get(self._alt_src or '', 0)
         new_pri = self._priority.get(src, 0)
 
-        # אל תוריד עדיפות אם יש ערך טרי ממקור חזק בשלוש השניות האחרונות
         if new_pri < cur_pri and (now - self._alt_ts) < ALT_SOURCE_HOLD_S:
             return
 
@@ -363,6 +452,7 @@ class FakeSticks:
 
             # Altitude (עדיפויות)
             if t == "ALTITUDE":
+                # שים לב: ב־pymavlink השדה נקרא altitude_relative
                 self._consider_alt(getattr(msg, "altitude_relative", None), "ALTITUDE")
 
             if t == "GLOBAL_POSITION_INT":
@@ -466,7 +556,8 @@ class FakeSticks:
                         rc4_to_send = int(RC_MID + yaw_cmd*500)
                     else:
                         rc4_to_send = RC_MID
-                    if self.thr.get() < YOLO_THR_MIN: self.thr.set(YOLO_THR_MIN)
+                    if self.thr.get() < YOLO_THR_MIN and not self.alt_hold_enabled:
+                        self.thr.set(YOLO_THR_MIN)
                     if YOLO_SHOW_WINDOW:
                         annotated = frame.copy()
                         cv2.rectangle(annotated,(int(x1),int(y1)),(int(x2),int(y2)),(0,255,0),2)
@@ -507,7 +598,11 @@ class FakeSticks:
 
     def on_close(self):
         if messagebox.askokcancel("Exit", "Close GUI?"):
-            self.running=False; self.stop_yolo(); time.sleep(0.05); self.root.destroy()
+            self.running=False
+            self.stop_yolo()
+            self.stop_alt_hold_ctrl()
+            time.sleep(0.05)
+            self.root.destroy()
 
 def main():
     root=tk.Tk()
