@@ -3,7 +3,7 @@
 """
 Fake RC Sticks GUI + PS4 Joystick
 - GUI סליידרים + שלט PS4
-- YOLO (אופציונלי): מעקב אדם ע"י YAW בלבד
+- YOLO + ByteTrack: מעקב אדם לפי YAW + הצגת Bounding Box + Track ID (צבע קבוע לכל ID)
 - ALT_HOLD (Pulse helper) + Alt-Hold Controller (סגור-לולאה) עם ▲/▼ 0.1m
 - טלמטריה (בשורה אחת): Alt, GroundSpeed, Dist to WP, Yaw, 3D Speed, DistToHome
 """
@@ -24,6 +24,21 @@ except Exception as _e:
     cv2 = None
     print("⚠️ YOLO/Camera unavailable:", _e)
 
+# ========= ByteTrack =========
+BT_OK = True
+try:
+    import numpy as np
+    # Patch for deprecated numpy aliases (נדרש ע"י YOLOX/ByteTrack ישנים)
+    if not hasattr(np, "float"): np.float = float
+    if not hasattr(np, "int"):   np.int   = int
+    if not hasattr(np, "bool"):  np.bool  = bool
+    import torch
+    from types import SimpleNamespace
+    from yolox.tracker.byte_tracker import BYTETracker
+except Exception as _e:
+    BT_OK = False
+    print("⚠️ ByteTrack unavailable:", _e)
+
 # ========= תצורה =========
 DEVICE = "COM40"  # לדוגמה: "COM14" / "udp:127.0.0.1:14550"
 BAUD   = 115200
@@ -31,14 +46,14 @@ RC_MIN, RC_MAX, RC_MID = 1000, 2000, 1500
 SEND_HZ = 20.0
 DEADZONE = 0.1
 
-# YOLO (Yaw בלבד)
+# YOLO + ByteTrack (מעקב Yaw על אדם)
 YOLO_DB_PIX = 40
 YOLO_YAW_GAIN = 0.6
 YOLO_THR_MIN = 1150
 YOLO_SHOW_WINDOW = True
 YOLO_CAM_INDEX = 0
 YOLO_MODEL_NAME = "yolov8n.pt"
-YOLO_PERSON_CLS = 0
+YOLO_PERSON_CLS = 0        # COCO: person=0
 
 # ALT_HOLD – Pulse helper
 ALT_BUMP_DEFAULT = 0.1
@@ -78,6 +93,17 @@ def _param_id_to_str(pid):
             return str(pid).rstrip('\x00')
     return str(pid).rstrip('\x00')
 
+# --- צבע יציב לכל Track ID ---
+def _id_color(track_id: int):
+    # מפה דטרמיניסטית ופשוטה ID->RGB (קריאה מהירה ללא RNG)
+    r = (37 * track_id) % 255
+    g = (17 * track_id) % 255
+    b = (29 * track_id) % 255
+    # ודא ניגודיות מסוימת
+    r = 60 if r < 60 else r
+    g = 60 if g < 60 else g
+    b = 60 if b < 60 else b
+    return int(b), int(g), int(r)  # OpenCV BGR
 
 class FakeSticks:
     def __init__(self, root):
@@ -184,7 +210,11 @@ class FakeSticks:
 
         # YOLO
         ly = ttk.LabelFrame(root, text="YOLO Yaw Tracking", padding=8); ly.pack(fill="x", padx=8, pady=6)
-        self.yolo_enabled = False; self.yolo_status = tk.StringVar(value="YOLO: ready" if YOLO_OK else "YOLO: unavailable")
+        self.yolo_enabled = False
+        ready_txt = "YOLO: ready"
+        if not YOLO_OK: ready_txt = "YOLO: unavailable"
+        if not BT_OK:   ready_txt += " (ByteTrack unavailable)"
+        self.yolo_status = tk.StringVar(value=ready_txt)
         ttk.Label(ly, textvariable=self.yolo_status).pack(side="left", padx=4)
         ttk.Button(ly, text="▶ Start", command=self.start_yolo).pack(side="left", padx=4)
         ttk.Button(ly, text="⏹ Stop",  command=self.stop_yolo).pack(side="left", padx=4)
@@ -507,13 +537,15 @@ class FakeSticks:
                 except Exception:
                     self.t_wpdist.set("--")
 
-    # ---------- YOLO ----------
+    # ---------- YOLO + ByteTrack ----------
     def start_yolo(self):
         if not YOLO_OK:
             messagebox.showwarning("YOLO", "YOLO/Camera not available"); return
+        if not BT_OK:
+            messagebox.showwarning("ByteTrack", "ByteTrack not available"); return
         if self.yolo_enabled: return
         self.yolo_enabled = True
-        self.yolo_status.set("YOLO: running (yaw only)")
+        self.yolo_status.set("YOLO: running (ByteTrack)")
         threading.Thread(target=self._yolo_loop, daemon=True).start()
 
     def stop_yolo(self):
@@ -523,65 +555,117 @@ class FakeSticks:
         self.yaw.set(RC_MID)
 
     def _yolo_loop(self):
+        # טען YOLO
         try:
             model = _YOLO(YOLO_MODEL_NAME)
         except Exception as e:
             print("⚠️ YOLO load failed:", e); self.yolo_status.set("YOLO: load failed"); self.yolo_enabled=False; return
+
+        # מצלמה
         cap = cv2.VideoCapture(YOLO_CAM_INDEX)
         if not cap.isOpened():
             print("⚠️ No camera found"); self.yolo_status.set("YOLO: no camera"); self.yolo_enabled=False; return
 
-        print("[YOLO] tracking person by YAW only. ESC/Q closes preview.")
+        # אתחל ByteTrack עם FPS מהמצלמה (נופל ל-30 אם לא ידוע)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = float(fps) if fps and fps > 0 else 30.0
+        bt_args = SimpleNamespace(track_thresh=0.15, match_thresh=0.8, track_buffer=30, frame_rate=fps, mot20=False)
+        tracker = BYTETracker(bt_args)
+
+        print("[YOLO+BT] tracking person by YAW only. ESC/Q closes preview.")
         while self.running and self.yolo_enabled:
             ok, frame = cap.read()
             if not ok: time.sleep(0.01); continue
-            h, w = frame.shape[:2]; cx_ref = w*0.5
+            h, w = frame.shape[:2]; cx_ref = w * 0.5
             rc4_to_send = None
+
             try:
                 results = model(frame, verbose=False)
-                best = None
+                # בנה דיטקציות רק ל-person (YOLO_PERSON_CLS)
+                det_list = []
                 for r in results:
                     if not hasattr(r, "boxes"): continue
                     for b in r.boxes:
                         cls = int(b.cls[0].item())
-                        if cls != YOLO_PERSON_CLS: continue
-                        conf = float(b.conf[0].item()) if hasattr(b,"conf") else 0.0
-                        if best is None or conf > best[0]:
-                            x1,y1,x2,y2 = map(float, b.xyxy[0])
-                            best = (conf, x1,y1,x2,y2)
-                if best is not None:
-                    _, x1,y1,x2,y2 = best
-                    cx = 0.5*(x1+x2); dx_px = cx - cx_ref
-                    if abs(dx_px) > YOLO_DB_PIX:
-                        norm = clamp(dx_px/(w*0.5), -1.0, 1.0)
+                        if cls != YOLO_PERSON_CLS:  # עקוב רק אחרי אדם
+                            continue
+                        x1, y1, x2, y2 = map(float, b.xyxy[0])
+                        conf = float(b.conf[0].item()) if hasattr(b, "conf") else 0.0
+                        det_list.append([x1, y1, x2, y2, conf, cls])
+
+                # המרה ל-Tensor עבור ByteTrack
+                if len(det_list) > 0:
+                    dets = torch.tensor(det_list, dtype=torch.float32)
+                else:
+                    dets = torch.empty((0, 6), dtype=torch.float32)
+
+                # עדכון מעקב
+                tracks = tracker.update(dets, frame.shape, frame.shape)
+
+                # בחר מטרה ל-YAW: ה-track שמרכזו הכי קרוב למרכז התמונה
+                target = None
+                min_abs_dx = 1e9
+
+                # צייר בוקסים + ID
+                annotated = frame.copy()
+                # קו מרכז אנכי לעזר
+                if YOLO_SHOW_WINDOW:
+                    cv2.line(annotated, (int(cx_ref), 0), (int(cx_ref), h), (255, 0, 0), 2)
+
+                for t in tracks:
+                    tlbr = t.tlbr.astype(int)        # [x1,y1,x2,y2]
+                    x1, y1, x2, y2 = tlbr.tolist()
+                    track_id = int(t.track_id)
+                    color = _id_color(track_id)
+
+                    # ציור תיבה + תווית ID
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(annotated, f"ID {track_id}", (x1, max(0, y1-10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                    # בחירת היעד הקרוב למרכז
+                    cx = 0.5 * (x1 + x2)
+                    dx_px = cx - cx_ref
+                    if abs(dx_px) < min_abs_dx:
+                        min_abs_dx = abs(dx_px)
+                        target = dx_px
+
+                # שליטת YAW על סמך היעד
+                if target is not None:
+                    if abs(target) > YOLO_DB_PIX:
+                        norm = clamp(target / (w * 0.5), -1.0, 1.0)
                         yaw_cmd = clamp(YOLO_YAW_GAIN * norm, -1.0, 1.0)
-                        rc4_to_send = int(RC_MID + yaw_cmd*500)
+                        rc4_to_send = int(RC_MID + yaw_cmd * 500)
                     else:
                         rc4_to_send = RC_MID
+
+                    # שמור מינימום מצערת בעת מעקב (אם לא Alt-Hold)
                     if self.thr.get() < YOLO_THR_MIN and not self.alt_hold_enabled:
                         self.thr.set(YOLO_THR_MIN)
-                    if YOLO_SHOW_WINDOW:
-                        annotated = frame.copy()
-                        cv2.rectangle(annotated,(int(x1),int(y1)),(int(x2),int(y2)),(0,255,0),2)
-                        cv2.line(annotated,(int(cx_ref),0),(int(cx_ref),h),(255,0,0),2)
-                        cv2.imshow("YOLO Yaw Tracking", annotated)
-                else:
-                    if YOLO_SHOW_WINDOW: cv2.imshow("YOLO Yaw Tracking", frame)
-            except Exception as e:
-                print("[YOLO] inference error:", e)
 
+                # הצג חלון
+                if YOLO_SHOW_WINDOW:
+                    cv2.imshow("YOLO + ByteTrack (Person Yaw Tracking)", annotated)
+
+            except Exception as e:
+                print("[YOLO+BT] inference/tracking error:", e)
+
+            # עדכן RC Yaw
             if rc4_to_send is not None:
                 self.yaw.set(clamp(rc4_to_send, RC_MIN, RC_MAX))
 
+            # יציאה ע"י ESC / q
             if YOLO_SHOW_WINDOW:
                 k = cv2.waitKey(1) & 0xFF
                 if k in (27, ord('q')): self.stop_yolo(); break
 
+        # ניקוי
         try:
             cap.release()
             if YOLO_SHOW_WINDOW: cv2.destroyAllWindows()
-        except Exception: pass
-        print("[YOLO] stopped")
+        except Exception:
+            pass
+        print("[YOLO+BT] stopped")
 
     # ---------- ARM/DISARM/Reset/Close ----------
     def force_arm(self):
@@ -605,7 +689,6 @@ class FakeSticks:
             self.stop_alt_hold_ctrl()
             time.sleep(0.05)
             self.root.destroy()
-
 
 def main():
     root=tk.Tk()
