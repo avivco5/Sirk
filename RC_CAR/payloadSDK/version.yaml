@@ -1,0 +1,11 @@
+type: components
+name: payloadSDK
+version: V0.1.0.0
+branch: develop
+commit: 6e132622
+
+image_tag: 
+image_name: 
+build_type: Release
+build_time: 2025-01-24 15:04:24
+project_url: git@gitlab-jh.private-cloud.autelrobotics.com:Departments/Softplat/module/payloadsdk.git
