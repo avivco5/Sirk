@@ -1,0 +1,423 @@
+Index: .idea/workspace.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/workspace.xml b/.idea/workspace.xml
+new file mode 100644
+--- /dev/null	(date 1761689722543)
++++ b/.idea/workspace.xml	(date 1761689722543)
+@@ -0,0 +1,400 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project version="4">
++  <component name="AutoImportSettings">
++    <option name="autoReloadType" value="SELECTIVE" />
++  </component>
++  <component name="ChangeListManager">
++    <list default="true" id="936e9bf8-fa64-4b1e-9520-65d0723552f3" name="Changes" comment="FlaskGui.py 1" />
++    <option name="SHOW_DIALOG" value="false" />
++    <option name="HIGHLIGHT_CONFLICTS" value="true" />
++    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
++    <option name="LAST_RESOLUTION" value="IGNORE" />
++  </component>
++  <component name="FileTemplateManagerImpl">
++    <option name="RECENT_TEMPLATES">
++      <list>
++        <option value="Python Unit Test" />
++        <option value="Python Stub" />
++        <option value="Python Script" />
++      </list>
++    </option>
++  </component>
++  <component name="Git.Settings">
++    <option name="PUSH_TAGS">
++      <GitPushTagMode>
++        <option name="argument" value="--tags" />
++        <option name="title" value="All" />
++      </GitPushTagMode>
++    </option>
++    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
++    <option name="ROOT_SYNC" value="DONT_SYNC" />
++  </component>
++  <component name="GitHubPullRequestSearchHistory">{
++  &quot;lastFilter&quot;: {
++    &quot;state&quot;: &quot;OPEN&quot;,
++    &quot;assignee&quot;: &quot;avivco5&quot;
++  }
++}</component>
++  <component name="GithubPullRequestsUISettings">{
++  &quot;selectedUrlAndAccountId&quot;: {
++    &quot;url&quot;: &quot;https://github.com/avivco5/Sirk.git&quot;,
++    &quot;accountId&quot;: &quot;832cc874-117a-4170-9740-321e7385d4b7&quot;
++  }
++}</component>
++  <component name="ProjectColorInfo">{
++  &quot;associatedIndex&quot;: 7
++}</component>
++  <component name="ProjectId" id="328t80452b92nCrYvfZlO6Lu4x6" />
++  <component name="ProjectViewState">
++    <option name="hideEmptyMiddlePackages" value="true" />
++    <option name="showLibraryContents" value="true" />
++  </component>
++  <component name="PropertiesComponent">{
++  &quot;keyToString&quot;: {
++    &quot;Python.1.executor&quot;: &quot;Run&quot;,
++    &quot;Python.A.executor&quot;: &quot;Run&quot;,
++    &quot;Python.Alt.executor&quot;: &quot;Run&quot;,
++    &quot;Python.BilliPS4.executor&quot;: &quot;Run&quot;,
++    &quot;Python.Drone2 PI_TCP.executor&quot;: &quot;Run&quot;,
++    &quot;Python.Drone2 PI_UDP.executor&quot;: &quot;Run&quot;,
++    &quot;Python.Drone2 PI_UDPV2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.FlaskGui.executor&quot;: &quot;Run&quot;,
++    &quot;Python.GUI.executor&quot;: &quot;Run&quot;,
++    &quot;Python.GuiV2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V10.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V11.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V3.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V4.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V5.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V6.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V7.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V8.executor&quot;: &quot;Run&quot;,
++    &quot;Python.H743V9.executor&quot;: &quot;Run&quot;,
++    &quot;Python.HybridTracker.executor&quot;: &quot;Run&quot;,
++    &quot;Python.HybridTrackerV2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.INAV.executor&quot;: &quot;Run&quot;,
++    &quot;Python.PARAM.executor&quot;: &quot;Run&quot;,
++    &quot;Python.PS4Control.executor&quot;: &quot;Run&quot;,
++    &quot;Python.Q.executor&quot;: &quot;Run&quot;,
++    &quot;Python.RCBilli.executor&quot;: &quot;Run&quot;,
++    &quot;Python.SITLYOLO.executor&quot;: &quot;Run&quot;,
++    &quot;Python.TelemetricFlask.executor&quot;: &quot;Run&quot;,
++    &quot;Python.Tracker.executor&quot;: &quot;Run&quot;,
++    &quot;Python.TrackerV2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.TrackerV3.executor&quot;: &quot;Run&quot;,
++    &quot;Python.TrackerV4.executor&quot;: &quot;Run&quot;,
++    &quot;Python.TrackerV5.executor&quot;: &quot;Run&quot;,
++    &quot;Python.TrackerV6.executor&quot;: &quot;Run&quot;,
++    &quot;Python.TrackerV7DeepSort.executor&quot;: &quot;Run&quot;,
++    &quot;Python.UDPtest.executor&quot;: &quot;Run&quot;,
++    &quot;Python.YOLO.executor&quot;: &quot;Run&quot;,
++    &quot;Python.aruco.executor&quot;: &quot;Run&quot;,
++    &quot;Python.arucoOrien.executor&quot;: &quot;Run&quot;,
++    &quot;Python.bridge.executor&quot;: &quot;Run&quot;,
++    &quot;Python.byte_tracker.executor&quot;: &quot;Run&quot;,
++    &quot;Python.datasets.executor&quot;: &quot;Run&quot;,
++    &quot;Python.drobekit.executor&quot;: &quot;Run&quot;,
++    &quot;Python.herthbit.executor&quot;: &quot;Run&quot;,
++    &quot;Python.isaacsimhover4.executor&quot;: &quot;Run&quot;,
++    &quot;Python.isaacsimhover6.executor&quot;: &quot;Run&quot;,
++    &quot;Python.main.executor&quot;: &quot;Run&quot;,
++    &quot;Python.main2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.map_server.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mav2sim.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mav2sim1.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mav2sim2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mav2sim3.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mavlink.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mavlink2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mavlink_arm_only.executor&quot;: &quot;Run&quot;,
++    &quot;Python.mission.executor&quot;: &quot;Run&quot;,
++    &quot;Python.missionSim.executor&quot;: &quot;Run&quot;,
++    &quot;Python.missionTeat.executor&quot;: &quot;Run&quot;,
++    &quot;Python.nano udp_client.executor&quot;: &quot;Run&quot;,
++    &quot;Python.nano udp_clientMav.executor&quot;: &quot;Run&quot;,
++    &quot;Python.print_rcmap_rcin.executor&quot;: &quot;Run&quot;,
++    &quot;Python.run.executor&quot;: &quot;Run&quot;,
++    &quot;Python.setup.executor&quot;: &quot;Run&quot;,
++    &quot;Python.teensy.executor&quot;: &quot;Run&quot;,
++    &quot;Python.teensyPI.executor&quot;: &quot;Run&quot;,
++    &quot;Python.telemetric.executor&quot;: &quot;Run&quot;,
++    &quot;Python.telemetry.executor&quot;: &quot;Run&quot;,
++    &quot;Python.test.executor&quot;: &quot;Run&quot;,
++    &quot;Python.test2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.tracker2.executor&quot;: &quot;Run&quot;,
++    &quot;Python.tracker_headless_lowlat.executor&quot;: &quot;Run&quot;,
++    &quot;Python.udptest.executor&quot;: &quot;Run&quot;,
++    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
++    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
++    &quot;last_opened_file_path&quot;: &quot;C:/Users/Aviv/PycharmProjects/81/Drone&quot;,
++    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;
++  }
++}</component>
++  <component name="RecentsManager">
++    <key name="CopyFile.RECENT_KEYS">
++      <recent name="C:\Users\Aviv\PycharmProjects\81\Drone" />
++      <recent name="C:\Users\Aviv\PycharmProjects\81\ByteTrack" />
++      <recent name="C:\Users\Aviv\PycharmProjects\81\RC_CAR" />
++      <recent name="C:\Users\Aviv\PycharmProjects\81" />
++    </key>
++    <key name="MoveFile.RECENT_KEYS">
++      <recent name="C:\Users\Aviv\PycharmProjects\81\other" />
++    </key>
++  </component>
++  <component name="RunManager" selected="Python.HybridTrackerV2">
++    <configuration name="FlaskGui" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
++      <module name="81" />
++      <option name="ENV_FILES" value="" />
++      <option name="INTERPRETER_OPTIONS" value="" />
++      <option name="PARENT_ENVS" value="true" />
++      <envs>
++        <env name="PYTHONUNBUFFERED" value="1" />
++      </envs>
++      <option name="SDK_HOME" value="" />
++      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Drone" />
++      <option name="IS_MODULE_SDK" value="true" />
++      <option name="ADD_CONTENT_ROOTS" value="true" />
++      <option name="ADD_SOURCE_ROOTS" value="true" />
++      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/Drone/FlaskGui.py" />
++      <option name="PARAMETERS" value="" />
++      <option name="SHOW_COMMAND_LINE" value="false" />
++      <option name="EMULATE_TERMINAL" value="false" />
++      <option name="MODULE_MODE" value="false" />
++      <option name="REDIRECT_INPUT" value="false" />
++      <option name="INPUT_FILE" value="" />
++      <method v="2" />
++    </configuration>
++    <configuration name="HybridTracker" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
++      <module name="81" />
++      <option name="ENV_FILES" value="" />
++      <option name="INTERPRETER_OPTIONS" value="" />
++      <option name="PARENT_ENVS" value="true" />
++      <envs>
++        <env name="PYTHONUNBUFFERED" value="1" />
++      </envs>
++      <option name="SDK_HOME" value="" />
++      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Drone" />
++      <option name="IS_MODULE_SDK" value="true" />
++      <option name="ADD_CONTENT_ROOTS" value="true" />
++      <option name="ADD_SOURCE_ROOTS" value="true" />
++      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/Drone/HybridTracker.py" />
++      <option name="PARAMETERS" value="" />
++      <option name="SHOW_COMMAND_LINE" value="false" />
++      <option name="EMULATE_TERMINAL" value="false" />
++      <option name="MODULE_MODE" value="false" />
++      <option name="REDIRECT_INPUT" value="false" />
++      <option name="INPUT_FILE" value="" />
++      <method v="2" />
++    </configuration>
++    <configuration name="HybridTrackerV2" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
++      <module name="81" />
++      <option name="ENV_FILES" value="" />
++      <option name="INTERPRETER_OPTIONS" value="" />
++      <option name="PARENT_ENVS" value="true" />
++      <envs>
++        <env name="PYTHONUNBUFFERED" value="1" />
++      </envs>
++      <option name="SDK_HOME" value="" />
++      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Drone" />
++      <option name="IS_MODULE_SDK" value="true" />
++      <option name="ADD_CONTENT_ROOTS" value="true" />
++      <option name="ADD_SOURCE_ROOTS" value="true" />
++      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/Drone/HybridTrackerV2.py" />
++      <option name="PARAMETERS" value="" />
++      <option name="SHOW_COMMAND_LINE" value="false" />
++      <option name="EMULATE_TERMINAL" value="false" />
++      <option name="MODULE_MODE" value="false" />
++      <option name="REDIRECT_INPUT" value="false" />
++      <option name="INPUT_FILE" value="" />
++      <method v="2" />
++    </configuration>
++    <configuration name="TelemetricFlask" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
++      <module name="81" />
++      <option name="ENV_FILES" value="" />
++      <option name="INTERPRETER_OPTIONS" value="" />
++      <option name="PARENT_ENVS" value="true" />
++      <envs>
++        <env name="PYTHONUNBUFFERED" value="1" />
++      </envs>
++      <option name="SDK_HOME" value="" />
++      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Drone" />
++      <option name="IS_MODULE_SDK" value="true" />
++      <option name="ADD_CONTENT_ROOTS" value="true" />
++      <option name="ADD_SOURCE_ROOTS" value="true" />
++      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/Drone/TelemetricFlask.py" />
++      <option name="PARAMETERS" value="" />
++      <option name="SHOW_COMMAND_LINE" value="false" />
++      <option name="EMULATE_TERMINAL" value="false" />
++      <option name="MODULE_MODE" value="false" />
++      <option name="REDIRECT_INPUT" value="false" />
++      <option name="INPUT_FILE" value="" />
++      <method v="2" />
++    </configuration>
++    <configuration name="map_server" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
++      <module name="81" />
++      <option name="ENV_FILES" value="" />
++      <option name="INTERPRETER_OPTIONS" value="" />
++      <option name="PARENT_ENVS" value="true" />
++      <envs>
++        <env name="PYTHONUNBUFFERED" value="1" />
++      </envs>
++      <option name="SDK_HOME" value="" />
++      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Drone" />
++      <option name="IS_MODULE_SDK" value="true" />
++      <option name="ADD_CONTENT_ROOTS" value="true" />
++      <option name="ADD_SOURCE_ROOTS" value="true" />
++      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/Drone/map_server.py" />
++      <option name="PARAMETERS" value="" />
++      <option name="SHOW_COMMAND_LINE" value="false" />
++      <option name="EMULATE_TERMINAL" value="false" />
++      <option name="MODULE_MODE" value="false" />
++      <option name="REDIRECT_INPUT" value="false" />
++      <option name="INPUT_FILE" value="" />
++      <method v="2" />
++    </configuration>
++    <list>
++      <item itemvalue="Python.FlaskGui" />
++      <item itemvalue="Python.HybridTracker" />
++      <item itemvalue="Python.HybridTrackerV2" />
++      <item itemvalue="Python.TelemetricFlask" />
++      <item itemvalue="Python.map_server" />
++    </list>
++    <recent_temporary>
++      <list>
++        <item itemvalue="Python.FlaskGui" />
++        <item itemvalue="Python.HybridTrackerV2" />
++        <item itemvalue="Python.TelemetricFlask" />
++        <item itemvalue="Python.HybridTracker" />
++        <item itemvalue="Python.map_server" />
++      </list>
++    </recent_temporary>
++  </component>
++  <component name="SharedIndexes">
++    <attachedChunks>
++      <set>
++        <option value="bundled-python-sdk-fc1d50d2d915-aa17d162503b-com.jetbrains.pycharm.community.sharedIndexes.bundled-PC-243.24978.54" />
++      </set>
++    </attachedChunks>
++  </component>
++  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
++  <component name="TaskManager">
++    <task active="true" id="Default" summary="Default task">
++      <changelist id="936e9bf8-fa64-4b1e-9520-65d0723552f3" name="Changes" comment="" />
++      <created>1756813863840</created>
++      <option name="number" value="Default" />
++      <option name="presentableId" value="Default" />
++      <updated>1756813863840</updated>
++    </task>
++    <task id="LOCAL‎-00001" summary="GUI FOR SIM">
++      <option name="closed" value="true" />
++      <created>1757153069332</created>
++      <option name="number" value="00001" />
++      <option name="presentableId" value="LOCAL‎-00001" />
++      <option name="project" value="LOCAL‎" />
++      <updated>1757153069332</updated>
++    </task>
++    <task id="LOCAL‎-00002" summary="Gyro + GUI + YOLO">
++      <option name="closed" value="true" />
++      <created>1757159434360</created>
++      <option name="number" value="00002" />
++      <option name="presentableId" value="LOCAL‎-00002" />
++      <option name="project" value="LOCAL‎" />
++      <updated>1757159434360</updated>
++    </task>
++    <task id="LOCAL‎-00003" summary="Gyro + GUI + YOLO">
++      <option name="closed" value="true" />
++      <created>1757353772420</created>
++      <option name="number" value="00003" />
++      <option name="presentableId" value="LOCAL‎-00003" />
++      <option name="project" value="LOCAL‎" />
++      <updated>1757353772420</updated>
++    </task>
++    <task id="LOCAL‎-00004" summary="PS4 Mavlink Gui">
++      <option name="closed" value="true" />
++      <created>1759176656059</created>
++      <option name="number" value="00004" />
++      <option name="presentableId" value="LOCAL‎-00004" />
++      <option name="project" value="LOCAL‎" />
++      <updated>1759176656059</updated>
++    </task>
++    <task id="LOCAL‎-00005" summary="PS4 Mavlink Gui 22V 6s">
++      <option name="closed" value="true" />
++      <created>1759177791681</created>
++      <option name="number" value="00005" />
++      <option name="presentableId" value="LOCAL‎-00005" />
++      <option name="project" value="LOCAL‎" />
++      <updated>1759177791681</updated>
++    </task>
++    <task id="LOCAL‎-00006" summary="conf">
++      <option name="closed" value="true" />
++      <created>1759711603193</created>
++      <option name="number" value="00006" />
++      <option name="presentableId" value="LOCAL‎-00006" />
++      <option name="project" value="LOCAL‎" />
++      <updated>1759711603193</updated>
++    </task>
++    <task id="LOCAL‎-00007" summary="FlaskGui.py">
++      <option name="closed" value="true" />
++      <created>1761687080436</created>
++      <option name="number" value="00007" />
++      <option name="presentableId" value="LOCAL‎-00007" />
++      <option name="project" value="LOCAL‎" />
++      <updated>1761687080436</updated>
++    </task>
++    <option name="localTasksCounter" value="8" />
++    <servers />
++  </component>
++  <component name="Vcs.Log.Tabs.Properties">
++    <option name="RECENT_FILTERS">
++      <map>
++        <entry key="Branch">
++          <value>
++            <list>
++              <RecentGroup>
++                <option name="FILTER_VALUES">
++                  <option value="main" />
++                </option>
++              </RecentGroup>
++            </list>
++          </value>
++        </entry>
++      </map>
++    </option>
++    <option name="TAB_STATES">
++      <map>
++        <entry key="MAIN">
++          <value>
++            <State />
++          </value>
++        </entry>
++      </map>
++    </option>
++  </component>
++  <component name="VcsManagerConfiguration">
++    <MESSAGE value="GUI FOR SIM" />
++    <MESSAGE value="Gyro + GUI + YOLO" />
++    <MESSAGE value="PS4 Mavlink Gui" />
++    <MESSAGE value="PS4 Mavlink Gui 22V 6s" />
++    <MESSAGE value="conf" />
++    <MESSAGE value="FlaskGui.py" />
++    <option name="LAST_COMMIT_MESSAGE" value="FlaskGui.py" />
++  </component>
++  <component name="XDebuggerManager">
++    <breakpoint-manager>
++      <breakpoints>
++        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
++          <url>file://$PROJECT_DIR$/other/H743V7.py</url>
++          <line>67</line>
++          <option name="timeStamp" value="1" />
++        </line-breakpoint>
++        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
++          <url>file://$PROJECT_DIR$/Drone/TrackerV2.py</url>
++          <line>10</line>
++          <option name="timeStamp" value="2" />
++        </line-breakpoint>
++      </breakpoints>
++    </breakpoint-manager>
++  </component>
++</project>
+\ No newline at end of file
+Index: DroTrack/drone-tracking-master/data/README.md
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/DroTrack/drone-tracking-master/data/README.md b/DroTrack/drone-tracking-master/data/README.md
+new file mode 100644
+--- /dev/null	(date 1759421746616)
++++ b/DroTrack/drone-tracking-master/data/README.md	(date 1759421746616)
+@@ -0,0 +1,2 @@
++# dataset folder
++Please put the sequences data under this folder
