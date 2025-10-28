@@ -1,0 +1,13 @@
+LICENSE
+README.md
+setup.py
+pymultiwii/__init__.py
+pymultiwii.egg-info/PKG-INFO
+pymultiwii.egg-info/SOURCES.txt
+pymultiwii.egg-info/dependency_links.txt
+pymultiwii.egg-info/top_level.txt
+tests/test-arm-disarm.py
+tests/test-imu-plot.py
+tests/test-imu-plot2.py
+tests/test-send.py
+tests/test-vtx.py
