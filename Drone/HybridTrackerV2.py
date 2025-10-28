@@ -15,6 +15,8 @@ Hybrid GUI Tracker:
 - Emergency Stop routine (neutral sticks, BRAKE fallback, LOITER)
 - Compact Tkinter UI + PS4 joystick mapping
 - Optional OpenCV preview and/or MJPEG web server
+- GPS panel: lat/lon, fix type, satellites, HDOP/VDOP
+- NEW: Telemetry UDP broadcast to Dash map_server (JSON @ :9002)
 
 Notes:
 - Keep comments ascii-only.
@@ -62,6 +64,9 @@ except Exception as e:
 
 from pymavlink import mavutil
 
+# NEW: required for telemetry UDP
+import json, socket
+
 
 # ---------------- Compact UI Settings ----------------
 UI_SCALE = 0.90
@@ -70,7 +75,7 @@ PADDING = 6
 INNER_PAD = 4
 LABEL_WIDTH = 12
 VALUE_WIDTH = 4
-GEOMETRY = "1120x860"
+GEOMETRY = "1120x920"
 
 # ---------------- Serial auto-detect ----------------
 if sys.platform.startswith("linux"):
@@ -129,7 +134,6 @@ DRAW_CONF_MIN    = 0.60
 DET_DOWNSCALE    = 0.67  # set to 1.0 to disable
 
 # --------- Class filter (CLI override) ----------
-# Default: track "person" (RPi-friendly). Pass --classnames to override.
 TARGET_CLASSES   = ["person"]
 TARGET_CLASS_IDS = None  # will be resolved after model loads
 
@@ -138,13 +142,13 @@ DS_MAX_AGE       = 45
 DS_N_INIT        = 3
 DS_MAX_IOU       = 0.7
 DS_NN_BUDGET     = 100
-DS_EMBEDDER      = "mobilenet"   # or "osnet_x0_25" if installed
+DS_EMBEDDER      = "mobilenet"
 DS_HALF          = True
 
 # ---------------- Lost-target scan ----------------
 LOST_TIMEOUT_S   = 1.0
 SCAN_PERIOD_S    = 3.5
-SCAN_AMPL_RC     = 140    # +/- microseconds around center
+SCAN_AMPL_RC     = 140
 
 # ---------------- Altitude handling ----------------
 ALT_SOURCE_HOLD_S = 1.5
@@ -200,92 +204,23 @@ NEAR_STOP_AREA_FRAC_DEFAULT = 0.120
 FAR_STOP_AREA_FRAC_DEFAULT  = 0.0015
 
 
-# ================= Utility funcs =================
-def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
-def apply_deadzone(val, dz=DEADZONE): return 0.0 if abs(val) < dz else val
+# =============== Telemetry UDP out (NEW) ===============
+TELEM_UDP_IP   = os.environ.get("TELEM_UDP_IP", "127.0.0.1")
+TELEM_UDP_PORT = int(os.environ.get("TELEM_UDP_PORT", "9002"))
 
-def haversine_m(lat1, lon1, lat2, lon2):
-    R = 6371000.0
-    a1, b1 = math.radians(lat1), math.radians(lon1)
-    a2, b2 = math.radians(lat2), math.radians(lon2)
-    da, db = a2 - a1, b2 - b1
-    h = math.sin(da/2)**2 + math.cos(a1)*math.cos(a2)*math.sin(db/2)**2
-    return 2 * R * math.asin(math.sqrt(h))
+class TelemetrySender:
+    """Non-blocking UDP sender for small JSON payloads."""
+    def __init__(self, ip: str, port: int):
+        self.addr = (ip, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
 
-def _param_id_to_str(pid):
-    if isinstance(pid, (bytes, bytearray)):
+    def send(self, payload: dict):
         try:
-            return pid.decode('ascii', errors='ignore').rstrip('\x00')
+            msg = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.sock.sendto(msg, self.addr)
         except Exception:
-            return str(pid).rstrip('\x00')
-    return str(pid).rstrip('\x00')
-
-def _id_color(track_id: int):
-    r = (37 * track_id) % 255
-    g = (17 * track_id) % 255
-    b = (29 * track_id) % 255
-    r = 60 if r < 60 else r
-    g = 60 if g < 60 else g
-    b = 60 if b < 60 else b
-    return int(b), int(g), int(r)  # OpenCV BGR
-
-def _rad2deg_wrap(rad: float) -> float:
-    deg = math.degrees(rad)
-    while deg > 180.0:  deg -= 360.0
-    while deg <= -180.0: deg += 360.0
-    return deg
-
-def _norm_name(s):
-    return re.sub(r"[^a-z0-9]", "", str(s).lower())
-
-
-# ---- CLI helpers ----
-def _normalize_classnames_arg(arg):
-    # supports: ["person","car"] or ["person,car"] or IDs like ["0","2"]
-    if arg is None: return None
-    if len(arg) == 1 and ("," in arg[0]):
-        return [tok.strip() for tok in arg[0].split(",") if tok.strip() != ""]
-    return arg
-
-def _resolve_class_ids(model, wanted):
-    # wanted: list[str|int] or None -> returns set[int] or None
-    if wanted is None:  # None => all classes
-        return None
-    if isinstance(wanted, (list, tuple)) and len(wanted) == 0:
-        return None
-    # map model names
-    id2name = {}
-    try:
-        names = model.names if hasattr(model, "names") else None
-        if isinstance(names, dict): id2name = names
-        elif names is not None:     id2name = {i: str(n) for i, n in enumerate(names)}
-    except Exception:
-        pass
-    ids = set()
-    for w in wanted:
-        if isinstance(w, int) or str(w).isdigit():
-            ids.add(int(w))
-        else:
-            wn = _norm_name(w)
-            for i, nm in id2name.items():
-                if _norm_name(nm) == wn:
-                    ids.add(i)
-    return ids if len(ids) > 0 else None
-
-def _parse_args():
-    p = argparse.ArgumentParser(description="Hybrid GUI Tracker (YOLOv8 + DeepSORT)")
-    p.add_argument("--tracker", choices=["deepsort", "bytetrack"], default="deepsort",
-                   help="tracking backend (bytetrack falls back to deepsort in this build)")
-    p.add_argument("--classnames", nargs="+", default=None,
-                   help="target classes by names or IDs. Examples: person car  or  0 2. "
-                        "Multiple tokens or a single comma-separated string are OK.")
-    p.add_argument("--yolo-model", default="yolov8n.pt", help="YOLOv8 model path/name")
-    p.add_argument("--det-downscale", type=float, default=0.67, help="inference downscale (0.2..1.0)")
-    p.add_argument("--conf", type=float, default=0.20, help="YOLO confidence threshold")
-    p.add_argument("--iou", type=float, default=0.50, help="YOLO NMS IoU threshold")
-    p.add_argument("--cam-index", type=int, default=0, help="OpenCV camera index")
-    p.add_argument("--no-window", action="store_true", help="disable OpenCV preview window")
-    return p.parse_args()
+            pass
 
 
 # ================= MJPEG Web Server (optional) =================
@@ -366,11 +301,18 @@ class FakeSticks:
                 )
             except Exception:
                 pass
+            # message rates
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ALTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD,              5)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,           1)
+            # GPS message rates
+            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT,          5)
+            try:
+                self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW,         5)
+            except Exception:
+                pass
         except Exception as e:
             messagebox.showerror("MAVLink", f"Connect failed: {e}")
             root.destroy(); return
@@ -419,6 +361,14 @@ class FakeSticks:
         self.t_yaw   = tk.StringVar(value="--")
         self._att_ts = 0.0
 
+        # GPS UI vars
+        self.t_lat  = tk.StringVar(value="--")
+        self.t_lon  = tk.StringVar(value="--")
+        self.t_fix  = tk.StringVar(value="--")
+        self.t_sats = tk.StringVar(value="--")
+        self.t_hdop = tk.StringVar(value="--")
+        self.t_vdop = tk.StringVar(value="--")
+
         # Position / altitude buffers
         self._cur_latlon  = None
         self._home_latlon = None
@@ -445,7 +395,6 @@ class FakeSticks:
         # Throttle smoothing state
         self._thr_last = RC_MIN
         self._thr_last_ts = time.time()
-
 
         # Visual forward state/toggles
         self._vs_pitch_rc = RC_MID
@@ -492,6 +441,15 @@ class FakeSticks:
         self._mk_metric(tele, "Dist to WP (m)",    self.t_wpdist)
         self._mk_metric(tele, "3D Speed (m/s)",    self.t_speed3d)
         self._mk_metric(tele, "DistToHome (m)",    self.t_disthome)
+
+        # GPS panel
+        gpsf = ttk.LabelFrame(root, text="GPS", padding=PADDING); gpsf.pack(fill="x", padx=PADDING, pady=INNER_PAD)
+        self._mk_metric(gpsf, "Lat (deg)",  self.t_lat)
+        self._mk_metric(gpsf, "Lon (deg)",  self.t_lon)
+        self._mk_metric(gpsf, "Fix",        self.t_fix)
+        self._mk_metric(gpsf, "Satellites", self.t_sats)
+        self._mk_metric(gpsf, "HDOP",       self.t_hdop)
+        self._mk_metric(gpsf, "VDOP",       self.t_vdop)
 
         ly = ttk.LabelFrame(root, text="YOLO + DeepSORT (Yaw + Forward)", padding=PADDING); ly.pack(fill="x", padx=PADDING, pady=INNER_PAD)
         self.yolo_enabled = False
@@ -565,6 +523,12 @@ class FakeSticks:
         threading.Thread(target=self._send_loop,             daemon=True).start()
         threading.Thread(target=self._mav_telemetry,         daemon=True).start()
         threading.Thread(target=self._guided_keepalive_loop, daemon=True).start()
+
+        # NEW: Telemetry UDP out (periodic)
+        self._tx = TelemetrySender(TELEM_UDP_IP, TELEM_UDP_PORT)
+        self._last_telem_tx = 0.0
+        self._telem_tx_hz   = 8.0
+        threading.Thread(target=self._telem_loop, daemon=True).start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.geometry(GEOMETRY)
@@ -653,7 +617,7 @@ class FakeSticks:
             apply_slew = self._is_hold_context()
         rc = int(value)
         if self._is_hold_context():
-            rc = clamp(rc, RC_MIN, THR_SAFE_MAX)
+            rc = max(RC_MIN, min(THR_SAFE_MAX, rc))
             now = time.time()
             dt = max(1e-3, now - self._thr_last_ts)
             max_step = int(THR_SLEW_US_PER_SEC * dt)
@@ -662,7 +626,7 @@ class FakeSticks:
             self._thr_last = rc
             self._thr_last_ts = now
         else:
-            rc = clamp(rc, RC_MIN, RC_MAX)
+            rc = max(RC_MIN, min(RC_MAX, rc))
         self.thr.set(rc)
 
     # ---------- Compact style ----------
@@ -721,9 +685,9 @@ class FakeSticks:
         rc7 = int(self.servo7.get())
         rc3 = int(self.thr.get())
         if self._is_hold_context():
-            rc3 = clamp(rc3, RC_MIN, THR_SAFE_MAX)
+            rc3 = max(RC_MIN, min(THR_SAFE_MAX, rc3))
         else:
-            rc3 = clamp(rc3, RC_MIN, RC_MAX)
+            rc3 = max(RC_MIN, min(RC_MAX, rc3))
         try:
             self.m.mav.rc_channels_override_send(
                 self.m.target_system, self.m.target_component,
@@ -754,7 +718,7 @@ class FakeSticks:
                 p = self.m.recv_match(type="PARAM_VALUE", blocking=False)
                 if not p:
                     time.sleep(0.02); continue
-                pid = _param_id_to_str(getattr(p, "param_id", ""))
+                pid = self._param_id_to_str(getattr(p, "param_id", ""))
                 if pid == target:
                     try: return float(p.param_value)
                     except Exception: return p.param_value
@@ -763,11 +727,14 @@ class FakeSticks:
             print(f"[PARAM] read {name} failed:", e)
         return default
 
-    def _hover_rc(self):
-        hover = self.get_param("MOT_THST_HOVER", default=0.5)
-        hover = clamp(hover if hover is not None else 0.5, 0.0, 1.0)
-        rc3_hover = int(RC_MIN + hover * (RC_MAX - RC_MIN))
-        return rc3_hover, hover
+    @staticmethod
+    def _param_id_to_str(pid):
+        if isinstance(pid, (bytes, bytearray)):
+            try:
+                return pid.decode('ascii', errors='ignore').rstrip('\x00')
+            except Exception:
+                return str(pid).rstrip('\x00')
+        return str(pid).rstrip('\x00')
 
     # ---------- ALT HOLD (RC helper) ----------
     def hold_alt(self):
@@ -790,8 +757,8 @@ class FakeSticks:
         sign = 1 if delta_m >= 0 else -1
         rate = v_up if sign>0 else v_dn
         frac = ALT_BUMP_FRAC
-        dur = clamp(abs(delta_m) / max(rate*frac, 1e-3), ALT_BUMP_MIN_T, ALT_BUMP_MAX_T)
-        rc_pulse = clamp(rc3_hover + sign*int(500*frac), RC_MIN, RC_MAX)
+        dur = max(ALT_BUMP_MIN_T, min(ALT_BUMP_MAX_T, abs(delta_m) / max(rate*frac, 1e-3)))
+        rc_pulse = max(RC_MIN, min(RC_MAX, rc3_hover + sign*int(500*frac)))
         def _do():
             self.set_mode("ALT_HOLD")
             self._alt_hold_helper_active = True
@@ -845,14 +812,20 @@ class FakeSticks:
                 rc3 = rc3_hover
             else:
                 delta_us = int(err * ALT_CTRL_KP_US_PER_M)
-                delta_us = clamp(delta_us, -ALT_CTRL_MAX_US, ALT_CTRL_MAX_US)
-                rc3 = clamp(rc3_hover + delta_us, RC_MIN, RC_MAX)
+                delta_us = max(-ALT_CTRL_MAX_US, min(ALT_CTRL_MAX_US, delta_us))
+                rc3 = max(RC_MIN, min(RC_MAX, rc3_hover + delta_us))
             self._set_thr(int(rc3))
             now = time.time()
             if now - last_print >= ALT_CTRL_PRINT_PERIOD:
                 print(f"[ALT-CTRL] alt={float(alt):.2f} m  tgt={tgt:.2f} m  err={err:.2f} m  rc3={int(self.thr.get())}")
                 last_print = now
             time.sleep(ALT_CTRL_DT)
+
+    def _hover_rc(self):
+        hover = self.get_param("MOT_THST_HOVER", default=0.5)
+        hover = max(0.0, min(1.0, hover if hover is not None else 0.5))
+        rc3_hover = int(RC_MIN + hover * (RC_MAX - RC_MIN))
+        return rc3_hover, hover
 
     # ---------- PS4 / RC TX loop ----------
     def _send_loop(self):
@@ -870,9 +843,9 @@ class FakeSticks:
                     if YAW_INVERT:   axis_yaw   = -axis_yaw
                     if THR_INVERT:   axis_thr   = -axis_thr
 
-                    axis_roll  = apply_deadzone(axis_roll)
-                    axis_pitch = apply_deadzone(axis_pitch)
-                    axis_yaw   = apply_deadzone(axis_yaw)
+                    axis_roll  = 0.0 if abs(axis_roll)  < DEADZONE else axis_roll
+                    axis_pitch = 0.0 if abs(axis_pitch) < DEADZONE else axis_pitch
+                    axis_yaw   = 0.0 if abs(axis_yaw)   < DEADZONE else axis_yaw
 
                     r = int(RC_MID + axis_roll  * 500)
                     p = int(RC_MID + axis_pitch * 500)
@@ -880,15 +853,15 @@ class FakeSticks:
                     t = RC_MIN if axis_thr <= 0 else int(RC_MIN + axis_thr * (RC_MAX - RC_MIN))
 
                     if (not self._is_hold_context()) and not (self.yolo_enabled and self.vs_thr_comp_en.get()):
-                        self.thr.set(clamp(t, RC_MIN, RC_MAX))
+                        self.thr.set(max(RC_MIN, min(RC_MAX, t)))
 
                     if not self.yolo_enabled:
-                        self.yaw.set(clamp(y, RC_MIN, RC_MAX))
+                        self.yaw.set(max(RC_MIN, min(RC_MAX, y)))
 
                     if not (self.yolo_enabled and self.vs_pitch_en.get()):
-                        self.pitch.set(clamp(p, RC_MIN, RC_MAX))
+                        self.pitch.set(max(RC_MIN, min(RC_MAX, p)))
 
-                    self.roll.set(clamp(r, RC_MIN, RC_MAX))
+                    self.roll.set(max(RC_MIN, min(RC_MAX, r)))
 
                     b0 = 1 if self.js.get_button(0) else 0  # X
                     b1 = 1 if self.js.get_button(1) else 0  # O
@@ -965,9 +938,9 @@ class FakeSticks:
 
             elif t == "ATTITUDE":
                 try:
-                    roll_deg  = _rad2deg_wrap(float(msg.roll))
-                    pitch_deg = _rad2deg_wrap(float(msg.pitch))
-                    yaw_deg   = _rad2deg_wrap(float(msg.yaw))
+                    roll_deg  = self._rad2deg_wrap(float(msg.roll))
+                    pitch_deg = self._rad2deg_wrap(float(msg.pitch))
+                    yaw_deg   = self._rad2deg_wrap(float(msg.yaw))
                     self.t_roll.set(f"{roll_deg:+.1f}")
                     self.t_pitch.set(f"{pitch_deg:+.1f}")
                     self.t_yaw.set(f"{yaw_deg:+.1f}")
@@ -990,13 +963,19 @@ class FakeSticks:
                     pass
                 try:
                     self._cur_latlon = (msg.lat/1e7, msg.lon/1e7)
-                    if self._home_latlon and all(self._cur_latlon):
-                        d = haversine_m(self._home_latlon[0], self._home_latlon[1],
-                                        self._cur_latlon[0],  self._cur_latlon[1])
+                    if self._cur_latlon and all(self._cur_latlon):
+                        self.t_lat.set(f"{self._cur_latlon[0]:.7f}")
+                        self.t_lon.set(f"{self._cur_latlon[1]:.7f}")
+                    else:
+                        self.t_lat.set("--"); self.t_lon.set("--")
+                    if self._home_latlon and self._cur_latlon and all(self._cur_latlon):
+                        d = self._haversine_m(self._home_latlon[0], self._home_latlon[1],
+                                              self._cur_latlon[0],  self._cur_latlon[1])
                         self.t_disthome.set(f"{d:.2f}")
                     else:
                         self.t_disthome.set("--")
                 except Exception:
+                    self.t_lat.set("--"); self.t_lon.set("--")
                     self.t_disthome.set("--")
 
             if t == "VFR_HUD":
@@ -1026,18 +1005,156 @@ class FakeSticks:
                 except Exception:
                     self.t_wpdist.set("--")
 
+            # GPS primary
+            if t == "GPS_RAW_INT":
+                try:
+                    self.t_fix.set(self._fix_type_to_str(getattr(msg, "fix_type", None)))
+                except Exception:
+                    self.t_fix.set("--")
+                try:
+                    sats = getattr(msg, "satellites_visible", None)
+                    self.t_sats.set(str(int(sats)) if sats is not None else "--")
+                except Exception:
+                    self.t_sats.set("--")
+                try:
+                    self.t_hdop.set(self._dop_from_raw(getattr(msg, "eph", None)))
+                    self.t_vdop.set(self._dop_from_raw(getattr(msg, "epv", None)))
+                except Exception:
+                    pass
+
+            # GPS secondary (optional log)
+            if t == "GPS2_RAW":
+                try:
+                    if (time.time() % 5.0) < 0.02:
+                        print(f"[GPS2] fix={self._fix_type_to_str(msg.fix_type)} sats={msg.satellites_visible} "
+                              f"HDOP={self._dop_from_raw(msg.eph)} VDOP={self._dop_from_raw(getattr(msg, 'epv', 0))}")
+                except Exception:
+                    pass
+
+    # ---------- Telemetry broadcast (NEW) ----------
+    def _telem_loop(self):
+        # periodic sender independent of MAVLink polling
+        period = 1.0 / max(1.0, self._telem_tx_hz)
+        while self.running:
+            try:
+                self._broadcast_telem()
+            except Exception:
+                pass
+            time.sleep(period)
+
+    def _broadcast_telem(self, force: bool = False):
+        now = time.time()
+        if (not force) and (now - self._last_telem_tx) < (1.0 / max(1e-3, self._telem_tx_hz)):
+            return
+
+        # Lat/Lon
+        lat, lon = None, None
+        if self._cur_latlon and all(self._cur_latlon):
+            lat, lon = float(self._cur_latlon[0]), float(self._cur_latlon[1])
+
+        # Attitude
+        try:
+            roll  = float(self.t_roll.get())   if self.t_roll.get()  != "--" else None
+            pitch = float(self.t_pitch.get())  if self.t_pitch.get() != "--" else None
+            yaw   = float(self.t_yaw.get())    if self.t_yaw.get()   != "--" else None
+        except Exception:
+            roll = pitch = yaw = None
+
+        # Speed/alt
+        try:
+            groundspeed = float(self.t_gspeed.get()) if self.t_gspeed.get() != "--" else None
+        except Exception:
+            groundspeed = None
+        try:
+            alt = float(self.t_alt.get()) if self.t_alt.get() != "--" else None
+        except Exception:
+            alt = None
+
+        # Battery voltage
+        try:
+            vb = self.batt_v.get()
+            voltage = float(vb.split()[0]) if vb and vb != "--.- V" else None
+        except Exception:
+            voltage = None
+
+        # GPS status
+        fix_txt = self.t_fix.get()
+        gps_ok = fix_txt in ("3D", "DGPS", "RTK-FIX", "RTK-FLOAT", "STATIC", "PPP")
+        try:
+            sats = int(self.t_sats.get()) if self.t_sats.get().strip().isdigit() else None
+        except Exception:
+            sats = None
+        hdop_txt = self.t_hdop.get()
+        try:
+            gps_hdop = float(hdop_txt) if hdop_txt not in ("--", "") else None
+        except Exception:
+            gps_hdop = None
+
+        payload = {
+            "lat": lat,
+            "lon": lon,
+            "roll": roll,
+            "pitch": pitch,
+            "yaw": yaw,
+            "groundspeed": groundspeed,
+            "alt": alt,
+            "voltage": voltage,
+            "gps_quality": None,        # optional numeric quality if available
+            "gps_sats": sats,
+            "gps_hdop": gps_hdop,
+            "device_status": {
+                "gps": gps_ok,
+                "mpu": (time.time() - self._att_ts) <= 1.0,
+                "obd": False
+            }
+        }
+
+        self._tx.send(payload)
+        self._last_telem_tx = now
+
     # ---------- Visual forward helpers ----------
-    def _vs_pitch_from_area(self, area_frac: float) -> int:
-        err = VS_TGT_AREA_FRAC - max(0.0, min(1.0, float(area_frac)))
-        if abs(err) < VS_DB_AREA_FRAC:
-            rc2 = RC_MID
-        else:
-            norm = clamp(err / max(VS_TGT_AREA_FRAC, 1e-6), -1.0, 1.0)
-            rc2 = int(RC_MID + VS_PITCH_FORWARD_SIGN * norm * VS_KP_PITCH * VS_MAX_RC_DELTA)
-        rc2 = int(self._vs_pitch_rc + VS_LP_ALPHA * (rc2 - self._vs_pitch_rc))
-        rc2 = clamp(rc2, RC_MIN, RC_MAX)
-        self._vs_pitch_rc = rc2
-        return rc2
+    @staticmethod
+    def _rad2deg_wrap(rad: float) -> float:
+        deg = math.degrees(rad)
+        while deg > 180.0:  deg -= 360.0
+        while deg <= -180.0: deg += 360.0
+        return deg
+
+    @staticmethod
+    def _haversine_m(lat1, lon1, lat2, lon2):
+        R = 6371000.0
+        a1, b1 = math.radians(lat1), math.radians(lon1)
+        a2, b2 = math.radians(lat2), math.radians(lon2)
+        da, db = a2 - a1, b2 - b1
+        h = math.sin(da/2)**2 + math.cos(a1)*math.cos(a2)*math.sin(db/2)**2
+        return 2 * R * math.asin(math.sqrt(h))
+
+    @staticmethod
+    def _fix_type_to_str(ft):
+        try: ft = int(ft)
+        except Exception: return "--"
+        return {
+            0: "NO-GPS",
+            1: "NO-FIX",
+            2: "2D",
+            3: "3D",
+            4: "DGPS",
+            5: "RTK-FIX",
+            6: "RTK-FLOAT",
+            7: "STATIC",
+            8: "PPP"
+        }.get(ft, str(ft))
+
+    @staticmethod
+    def _dop_from_raw(raw):
+        try:
+            v = float(raw)
+            if v <= 0: return "--"
+            if v > 50:
+                return f"{(v/100.0):.2f}"
+            return f"{v:.2f}"
+        except Exception:
+            return "--"
 
     # ---------- YOLO + DeepSORT (optional) ----------
     def start_yolo(self):
@@ -1059,15 +1176,14 @@ class FakeSticks:
         self.pitch.set(self._vs_pitch_rc)
 
     def _yolo_loop(self):
-        # Load YOLO
         try:
             model = _YOLO(YOLO_MODEL_NAME)
         except Exception as e:
             print("YOLO load failed:", e); self.yolo_status.set("YOLO: load failed"); self.yolo_enabled=False; return
 
-        # Resolve target class IDs from CLI names/ids
+        # Resolve target class IDs
         global TARGET_CLASS_IDS
-        TARGET_CLASS_IDS = _resolve_class_ids(model, TARGET_CLASSES)
+        TARGET_CLASS_IDS = self._resolve_class_ids(model, TARGET_CLASSES)
         try:
             names = model.names if hasattr(model, "names") else None
             if TARGET_CLASS_IDS is None:
@@ -1084,7 +1200,7 @@ class FakeSticks:
         except Exception:
             pass
 
-        # Try CUDA/Half if available (best effort; safe to fail)
+        # Try CUDA/Half if available (best effort)
         try:
             import torch
             if torch.cuda.is_available():
@@ -1176,7 +1292,7 @@ class FakeSticks:
                         if TARGET_CLASS_IDS is not None and cls not in TARGET_CLASS_IDS:
                             continue
                         x1, y1, x2, y2 = map(float, b.xyxy[0])
-                        # map back to original frame size
+                        # map back
                         x1, x2 = x1 * scale_x, x2 * scale_x
                         y1, y2 = y1 * scale_y, y2 * scale_y
                         conf = float(b.conf[0].item()) if hasattr(b, "conf") else 0.0
@@ -1220,7 +1336,7 @@ class FakeSticks:
                     candidates.append((score, tid, dx, (float(l), float(t), float(r), float(b)), area, conf_t))
 
                     if YOLO_SHOW_WINDOW:
-                        color = _id_color(tid)
+                        color = self._id_color(tid)
                         cv2.rectangle(annotated, (int(l), int(t)), (int(r), int(b)), color, 2)
                         label = f"ID {tid}"
                         if conf_t > 0: label += f" {conf_t:.2f}"
@@ -1245,7 +1361,7 @@ class FakeSticks:
                             x1, y1, x2, y2 = map(int, sel_bbox)
                             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 128, 255), 2)
 
-                # Yaw controller: PD + gain scheduling + deadband
+                # Yaw controller
                 dt = max(1e-3, now - self._last_loop_ts)
                 self._last_loop_ts = now
 
@@ -1271,14 +1387,13 @@ class FakeSticks:
                     if abs(self._dx_lp) <= YAW_DB_PIX:
                         rc4_to_send = RC_MID
                     else:
-                        # gain schedule: stronger far from center, softer near center
                         err_norm = min(1.0, abs(self._dx_lp) / (w * 0.5))
                         kp_eff = kp * (0.85 + 0.30 * err_norm)
                         kd_eff = kd * (0.85 + 0.30 * err_norm)
 
-                        e_norm = clamp(self._dx_lp / (w * 0.5), -1.0, 1.0)
-                        d_norm = clamp(d_err     / (w * 0.5), -1.0, 1.0)
-                        yaw_cmd = clamp(kp_eff * e_norm + kd_eff * d_norm, -1.0, 1.0)
+                        e_norm = max(-1.0, min(1.0, self._dx_lp / (w * 0.5)))
+                        d_norm = max(-1.0, min(1.0, d_err     / (w * 0.5)))
+                        yaw_cmd = max(-1.0, min(1.0, kp_eff * e_norm + kd_eff * d_norm))
                         rc4_to_send = int(RC_MID + yaw_cmd * YAW_MAX_RC_DELTA)
 
                     # ensure minimal throttle for tracking if not in hold
@@ -1298,7 +1413,7 @@ class FakeSticks:
                     if sel_bbox is not None and (area_frac is not None) and abs(self._dx_lp) <= yaw_ok and (far_sz <= area_frac <= near_sz):
                         # soft-stop factor as area approaches NEAR
                         if near_sz > VS_TGT_AREA_FRAC:
-                            soft = clamp((near_sz - area_frac) / (near_sz - VS_TGT_AREA_FRAC), 0.0, 1.0)
+                            soft = max(0.0, min(1.0, (near_sz - area_frac) / (near_sz - VS_TGT_AREA_FRAC)))
                         else:
                             soft = 1.0
                         rc2_raw = self._vs_pitch_from_area(area_frac)
@@ -1306,7 +1421,7 @@ class FakeSticks:
                         if self.vs_thr_comp_en.get() and not self._is_hold_context():
                             base = max(self.thr.get(), YOLO_THR_MIN)
                             forward_strength = max(0.0, (rc2_to_send - RC_MID) / float(VS_MAX_RC_DELTA))
-                            add = int(clamp(forward_strength * VS_THR_COMP_GAIN_US, 0, VS_THR_COMP_MAX_US))
+                            add = int(max(0, min(VS_THR_COMP_MAX_US, forward_strength * VS_THR_COMP_GAIN_US)))
                             self._set_thr(base + add)
                     else:
                         self._vs_pitch_rc = int(self._vs_pitch_rc + 0.35 * (RC_MID - self._vs_pitch_rc))
@@ -1316,13 +1431,13 @@ class FakeSticks:
 
                 # Apply RC + draw
                 if rc4_to_send is not None:
-                    self.yaw.set(clamp(rc4_to_send, RC_MIN, RC_MAX))
+                    self.yaw.set(max(RC_MIN, min(RC_MAX, rc4_to_send)))
                     if YOLO_SHOW_WINDOW:
                         cv2.putText(annotated, f"CH4={rc4_to_send} src={src or '-'}",
                                     (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,200,255), 2)
 
                 if rc2_to_send is not None:
-                    self.pitch.set(clamp(rc2_to_send, RC_MIN, RC_MAX))
+                    self.pitch.set(max(RC_MIN, min(RC_MAX, rc2_to_send)))
                     if YOLO_SHOW_WINDOW:
                         txt = f"CH2={rc2_to_send}"
                         if area_frac is not None: txt += f" area={area_frac:.3f}"
@@ -1357,6 +1472,40 @@ class FakeSticks:
         except Exception:
             pass
         print("[YOLO+DS] stopped")
+
+    def _vs_pitch_from_area(self, area_frac: float) -> int:
+        err = VS_TGT_AREA_FRAC - max(0.0, min(1.0, float(area_frac)))
+        if abs(err) < VS_DB_AREA_FRAC:
+            rc2 = RC_MID
+        else:
+            norm = max(-1.0, min(1.0, err / max(VS_TGT_AREA_FRAC, 1e-6)))
+            rc2 = int(RC_MID + VS_PITCH_FORWARD_SIGN * norm * VS_KP_PITCH * VS_MAX_RC_DELTA)
+        rc2 = int(self._vs_pitch_rc + VS_LP_ALPHA * (rc2 - self._vs_pitch_rc))
+        rc2 = max(RC_MIN, min(RC_MAX, rc2))
+        self._vs_pitch_rc = rc2
+        return rc2
+
+    @staticmethod
+    def _resolve_class_ids(model, wanted):
+        if wanted is None or (isinstance(wanted, (list, tuple)) and len(wanted) == 0):
+            return None
+        id2name = {}
+        try:
+            names = model.names if hasattr(model, "names") else None
+            if isinstance(names, dict): id2name = names
+            elif names is not None:     id2name = {i: str(n) for i, n in enumerate(names)}
+        except Exception:
+            pass
+        ids = set()
+        for w in wanted:
+            if isinstance(w, int) or str(w).isdigit():
+                ids.add(int(w))
+            else:
+                wn = re.sub(r"[^a-z0-9]", "", str(w).lower())
+                for i, nm in id2name.items():
+                    if re.sub(r"[^a-z0-9]", "", str(nm).lower()) == wn:
+                        ids.add(i)
+        return ids if len(ids) > 0 else None
 
     # ---------- GUIDED setpoint control ----------
     def _time_boot_ms(self) -> int:
@@ -1536,9 +1685,30 @@ class FakeSticks:
             self.root.destroy()
 
 
+# ================= CLI =================
+def _normalize_classnames_arg(arg):
+    if arg is None: return None
+    if len(arg) == 1 and ("," in arg[0]):
+        return [tok.strip() for tok in arg[0].split(",") if tok.strip() != ""]
+    return arg
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="Hybrid GUI Tracker (YOLOv8 + DeepSORT)")
+    p.add_argument("--tracker", choices=["deepsort", "bytetrack"], default="deepsort",
+                   help="tracking backend (bytetrack falls back to deepsort in this build)")
+    p.add_argument("--classnames", nargs="+", default=None,
+                   help="target classes by names or IDs. Examples: person car  or  0 2. "
+                        "Multiple tokens or a single comma-separated string are OK.")
+    p.add_argument("--yolo-model", default="yolov8n.pt", help="YOLOv8 model path/name")
+    p.add_argument("--det-downscale", type=float, default=0.67, help="inference downscale (0.2..1.0)")
+    p.add_argument("--conf", type=float, default=0.20, help="YOLO confidence threshold")
+    p.add_argument("--iou", type=float, default=0.50, help="YOLO NMS IoU threshold")
+    p.add_argument("--cam-index", type=int, default=0, help="OpenCV camera index")
+    p.add_argument("--no-window", action="store_true", help="disable OpenCV preview window")
+    return p.parse_args()
+
 # ================= main =================
 def main():
-    # Parse CLI and apply overrides
     global YOLO_MODEL_NAME, DET_DOWNSCALE, YOLO_CONF, YOLO_IOU
     global YOLO_CAM_INDEX, YOLO_SHOW_WINDOW, TARGET_CLASSES
 

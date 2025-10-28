@@ -15,6 +15,7 @@ Hybrid GUI Tracker:
 - Emergency Stop routine (neutral sticks, BRAKE fallback, LOITER)
 - Compact Tkinter UI + PS4 joystick mapping
 - Optional OpenCV preview and/or MJPEG web server
+- GPS panel: lat/lon, fix type, satellites, HDOP/VDOP
 
 Notes:
 - Keep comments ascii-only.
@@ -70,7 +71,7 @@ PADDING = 6
 INNER_PAD = 4
 LABEL_WIDTH = 12
 VALUE_WIDTH = 4
-GEOMETRY = "1120x860"
+GEOMETRY = "1120x920"
 
 # ---------------- Serial auto-detect ----------------
 if sys.platform.startswith("linux"):
@@ -206,11 +207,15 @@ def apply_deadzone(val, dz=DEADZONE): return 0.0 if abs(val) < dz else val
 
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
-    a1, b1 = math.radians(lat1), math.radians(lon1)
-    a2, b2 = math.radians(lat2), math.radians(lon2)
+    a1, b1 = math.to_radians(lat1), math.to_radians(lon1)
+    a2, b2 = math.to_radians(lat2), math.to_radians(lon2)
     da, db = a2 - a1, b2 - b1
     h = math.sin(da/2)**2 + math.cos(a1)*math.cos(a2)*math.sin(db/2)**2
     return 2 * R * math.asin(math.sqrt(h))
+
+# python 3.8 compatibility shim (no math.to_radians)
+if not hasattr(math, "to_radians"):
+    math.to_radians = math.radians
 
 def _param_id_to_str(pid):
     if isinstance(pid, (bytes, bytearray)):
@@ -237,6 +242,32 @@ def _rad2deg_wrap(rad: float) -> float:
 
 def _norm_name(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+# --- GPS helpers ---
+def _fix_type_to_str(ft):
+    try: ft = int(ft)
+    except Exception: return "--"
+    return {
+        0: "NO-GPS",
+        1: "NO-FIX",
+        2: "2D",
+        3: "3D",
+        4: "DGPS",
+        5: "RTK-FIX",
+        6: "RTK-FLOAT",
+        7: "STATIC",
+        8: "PPP"
+    }.get(ft, str(ft))
+
+def _dop_from_raw(raw):
+    try:
+        v = float(raw)
+        if v <= 0: return "--"
+        if v > 50:   # treat as x100 scaled
+            return f"{(v/100.0):.2f}"
+        return f"{v:.2f}"
+    except Exception:
+        return "--"
 
 
 # ---- CLI helpers ----
@@ -366,11 +397,18 @@ class FakeSticks:
                 )
             except Exception:
                 pass
+            # message rates
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ALTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD,              5)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,           1)
+            # GPS message rates
+            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT,          5)
+            try:
+                self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW,         5)
+            except Exception:
+                pass
         except Exception as e:
             messagebox.showerror("MAVLink", f"Connect failed: {e}")
             root.destroy(); return
@@ -419,6 +457,14 @@ class FakeSticks:
         self.t_yaw   = tk.StringVar(value="--")
         self._att_ts = 0.0
 
+        # GPS UI vars
+        self.t_lat  = tk.StringVar(value="--")
+        self.t_lon  = tk.StringVar(value="--")
+        self.t_fix  = tk.StringVar(value="--")
+        self.t_sats = tk.StringVar(value="--")
+        self.t_hdop = tk.StringVar(value="--")
+        self.t_vdop = tk.StringVar(value="--")
+
         # Position / altitude buffers
         self._cur_latlon  = None
         self._home_latlon = None
@@ -445,7 +491,6 @@ class FakeSticks:
         # Throttle smoothing state
         self._thr_last = RC_MIN
         self._thr_last_ts = time.time()
-
 
         # Visual forward state/toggles
         self._vs_pitch_rc = RC_MID
@@ -492,6 +537,15 @@ class FakeSticks:
         self._mk_metric(tele, "Dist to WP (m)",    self.t_wpdist)
         self._mk_metric(tele, "3D Speed (m/s)",    self.t_speed3d)
         self._mk_metric(tele, "DistToHome (m)",    self.t_disthome)
+
+        # GPS panel
+        gpsf = ttk.LabelFrame(root, text="GPS", padding=PADDING); gpsf.pack(fill="x", padx=PADDING, pady=INNER_PAD)
+        self._mk_metric(gpsf, "Lat (deg)",  self.t_lat)
+        self._mk_metric(gpsf, "Lon (deg)",  self.t_lon)
+        self._mk_metric(gpsf, "Fix",        self.t_fix)
+        self._mk_metric(gpsf, "Satellites", self.t_sats)
+        self._mk_metric(gpsf, "HDOP",       self.t_hdop)
+        self._mk_metric(gpsf, "VDOP",       self.t_vdop)
 
         ly = ttk.LabelFrame(root, text="YOLO + DeepSORT (Yaw + Forward)", padding=PADDING); ly.pack(fill="x", padx=PADDING, pady=INNER_PAD)
         self.yolo_enabled = False
@@ -990,13 +1044,19 @@ class FakeSticks:
                     pass
                 try:
                     self._cur_latlon = (msg.lat/1e7, msg.lon/1e7)
-                    if self._home_latlon and all(self._cur_latlon):
+                    if self._cur_latlon and all(self._cur_latlon):
+                        self.t_lat.set(f"{self._cur_latlon[0]:.7f}")
+                        self.t_lon.set(f"{self._cur_latlon[1]:.7f}")
+                    else:
+                        self.t_lat.set("--"); self.t_lon.set("--")
+                    if self._home_latlon and self._cur_latlon and all(self._cur_latlon):
                         d = haversine_m(self._home_latlon[0], self._home_latlon[1],
                                         self._cur_latlon[0],  self._cur_latlon[1])
                         self.t_disthome.set(f"{d:.2f}")
                     else:
                         self.t_disthome.set("--")
                 except Exception:
+                    self.t_lat.set("--"); self.t_lon.set("--")
                     self.t_disthome.set("--")
 
             if t == "VFR_HUD":
@@ -1025,6 +1085,32 @@ class FakeSticks:
                     self.t_wpdist.set(f"{dwp:.2f}" if dwp > 0 else "--")
                 except Exception:
                     self.t_wpdist.set("--")
+
+            # GPS primary
+            if t == "GPS_RAW_INT":
+                try:
+                    self.t_fix.set(_fix_type_to_str(getattr(msg, "fix_type", None)))
+                except Exception:
+                    self.t_fix.set("--")
+                try:
+                    sats = getattr(msg, "satellites_visible", None)
+                    self.t_sats.set(str(int(sats)) if sats is not None else "--")
+                except Exception:
+                    self.t_sats.set("--")
+                try:
+                    self.t_hdop.set(_dop_from_raw(getattr(msg, "eph", None)))
+                    self.t_vdop.set(_dop_from_raw(getattr(msg, "epv", None)))
+                except Exception:
+                    pass
+
+            # GPS secondary (optional log)
+            if t == "GPS2_RAW":
+                try:
+                    if (time.time() % 5.0) < 0.02:
+                        print(f"[GPS2] fix={_fix_type_to_str(msg.fix_type)} sats={msg.satellites_visible} "
+                              f"HDOP={_dop_from_raw(msg.eph)} VDOP={_dop_from_raw(getattr(msg, 'epv', 0))}")
+                except Exception:
+                    pass
 
     # ---------- Visual forward helpers ----------
     def _vs_pitch_from_area(self, area_frac: float) -> int:
