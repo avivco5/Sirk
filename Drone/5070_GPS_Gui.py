@@ -11,11 +11,10 @@ Hybrid GUI Tracker:
 - Gentle throttle compensation when moving forward
 - Lost-target scan (sin sweep)
 - Alt-Hold helper (RC pulses) + Baro Alt-Hold closed loop
-- GUIDED "hold here" keepalive (relative alt) + +/- bumps
+- GUIDED "hold here" keepalive (relative alt) + +/- bumps + Go-To GPS target
 - Emergency Stop routine (neutral sticks, BRAKE fallback, LOITER)
 - Compact Tkinter UI + PS4 joystick mapping
 - Optional OpenCV preview and/or MJPEG web server
-- GPS panel: lat/lon, fix type, satellites, HDOP/VDOP
 
 Notes:
 - Keep comments ascii-only.
@@ -24,11 +23,15 @@ Notes:
 """
 
 import sys, glob
+from serial.tools import list_ports
 import math, time, threading, queue, re, os
 import argparse
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter import font as tkfont
+from tkinter import simpledialog  # added for Go-To prompt
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Numpy must be imported before some trackers; also patch legacy aliases
 import numpy as np
@@ -71,7 +74,7 @@ PADDING = 6
 INNER_PAD = 4
 LABEL_WIDTH = 12
 VALUE_WIDTH = 4
-GEOMETRY = "1120x920"
+GEOMETRY = "1120x860"
 
 # ---------------- Serial auto-detect ----------------
 if sys.platform.startswith("linux"):
@@ -79,8 +82,19 @@ if sys.platform.startswith("linux"):
     DEVICE = cands[0] if cands else "/dev/ttyACM0"
     BAUD = 115200
 else:
-    DEVICE = "COM4"
+    # === Auto-detect MAVLink port on Windows ===
+    DEVICE = None
+    for p in list_ports.comports():
+        name = (p.description or "").lower()
+        if "mavlink" in name:
+            DEVICE = p.device
+            print(f"[AUTO] Found MAVLink device: {p.device} ({p.description})")
+            break
+    if DEVICE is None:
+        print("[WARN] No MAVLink port found, defaulting to COM4")
+        DEVICE = "COM4"
     BAUD = 115200
+
 
 # ---------------- Joystick Mapping ----------------
 # Linux (RPi) PS4 axis mapping:
@@ -207,15 +221,11 @@ def apply_deadzone(val, dz=DEADZONE): return 0.0 if abs(val) < dz else val
 
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
-    a1, b1 = math.to_radians(lat1), math.to_radians(lon1)
-    a2, b2 = math.to_radians(lat2), math.to_radians(lon2)
+    a1, b1 = math.radians(lat1), math.radians(lon1)
+    a2, b2 = math.radians(lat2), math.radians(lon2)
     da, db = a2 - a1, b2 - b1
     h = math.sin(da/2)**2 + math.cos(a1)*math.cos(a2)*math.sin(db/2)**2
     return 2 * R * math.asin(math.sqrt(h))
-
-# python 3.8 compatibility shim (no math.to_radians)
-if not hasattr(math, "to_radians"):
-    math.to_radians = math.radians
 
 def _param_id_to_str(pid):
     if isinstance(pid, (bytes, bytearray)):
@@ -242,32 +252,6 @@ def _rad2deg_wrap(rad: float) -> float:
 
 def _norm_name(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
-
-# --- GPS helpers ---
-def _fix_type_to_str(ft):
-    try: ft = int(ft)
-    except Exception: return "--"
-    return {
-        0: "NO-GPS",
-        1: "NO-FIX",
-        2: "2D",
-        3: "3D",
-        4: "DGPS",
-        5: "RTK-FIX",
-        6: "RTK-FLOAT",
-        7: "STATIC",
-        8: "PPP"
-    }.get(ft, str(ft))
-
-def _dop_from_raw(raw):
-    try:
-        v = float(raw)
-        if v <= 0: return "--"
-        if v > 50:   # treat as x100 scaled
-            return f"{(v/100.0):.2f}"
-        return f"{v:.2f}"
-    except Exception:
-        return "--"
 
 
 # ---- CLI helpers ----
@@ -397,18 +381,11 @@ class FakeSticks:
                 )
             except Exception:
                 pass
-            # message rates
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ALTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD,              5)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,           1)
-            # GPS message rates
-            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT,          5)
-            try:
-                self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW,         5)
-            except Exception:
-                pass
         except Exception as e:
             messagebox.showerror("MAVLink", f"Connect failed: {e}")
             root.destroy(); return
@@ -456,14 +433,6 @@ class FakeSticks:
         self.t_pitch = tk.StringVar(value="--")
         self.t_yaw   = tk.StringVar(value="--")
         self._att_ts = 0.0
-
-        # GPS UI vars
-        self.t_lat  = tk.StringVar(value="--")
-        self.t_lon  = tk.StringVar(value="--")
-        self.t_fix  = tk.StringVar(value="--")
-        self.t_sats = tk.StringVar(value="--")
-        self.t_hdop = tk.StringVar(value="--")
-        self.t_vdop = tk.StringVar(value="--")
 
         # Position / altitude buffers
         self._cur_latlon  = None
@@ -538,15 +507,6 @@ class FakeSticks:
         self._mk_metric(tele, "3D Speed (m/s)",    self.t_speed3d)
         self._mk_metric(tele, "DistToHome (m)",    self.t_disthome)
 
-        # GPS panel
-        gpsf = ttk.LabelFrame(root, text="GPS", padding=PADDING); gpsf.pack(fill="x", padx=PADDING, pady=INNER_PAD)
-        self._mk_metric(gpsf, "Lat (deg)",  self.t_lat)
-        self._mk_metric(gpsf, "Lon (deg)",  self.t_lon)
-        self._mk_metric(gpsf, "Fix",        self.t_fix)
-        self._mk_metric(gpsf, "Satellites", self.t_sats)
-        self._mk_metric(gpsf, "HDOP",       self.t_hdop)
-        self._mk_metric(gpsf, "VDOP",       self.t_vdop)
-
         ly = ttk.LabelFrame(root, text="YOLO + DeepSORT (Yaw + Forward)", padding=PADDING); ly.pack(fill="x", padx=PADDING, pady=INNER_PAD)
         self.yolo_enabled = False
         ready_txt = "YOLO: ready" if YOLO_OK else "YOLO: unavailable"
@@ -577,11 +537,15 @@ class FakeSticks:
 
         ttk.Button(tun, text="Reset to defaults", command=self._reset_tunables).pack(side="right", padx=INNER_PAD)
 
-        # Flight modes + Control buttons
+        # Flight modes + GUIDED helpers
         mf = ttk.LabelFrame(root, text="Flight Modes", padding=PADDING)
         mf.pack(fill="x", padx=PADDING, pady=INNER_PAD)
         ttk.Button(mf, text="GUIDED",    command=lambda: self.set_mode("GUIDED")).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
         ttk.Button(mf, text="STABILIZE", command=lambda: self.set_mode("STABILIZE")).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="Hold Here", command=self.hold_alt_guided_here).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="Go To…",    command=self.prompt_go_to).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="+1m",       command=lambda: self.bump_alt_guided(+1.0)).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="-1m",       command=lambda: self.bump_alt_guided(-1.0)).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
 
         btns = ttk.Frame(root, padding=PADDING); btns.pack(fill="x")
 
@@ -1044,19 +1008,13 @@ class FakeSticks:
                     pass
                 try:
                     self._cur_latlon = (msg.lat/1e7, msg.lon/1e7)
-                    if self._cur_latlon and all(self._cur_latlon):
-                        self.t_lat.set(f"{self._cur_latlon[0]:.7f}")
-                        self.t_lon.set(f"{self._cur_latlon[1]:.7f}")
-                    else:
-                        self.t_lat.set("--"); self.t_lon.set("--")
-                    if self._home_latlon and self._cur_latlon and all(self._cur_latlon):
+                    if self._home_latlon and all(self._cur_latlon):
                         d = haversine_m(self._home_latlon[0], self._home_latlon[1],
                                         self._cur_latlon[0],  self._cur_latlon[1])
                         self.t_disthome.set(f"{d:.2f}")
                     else:
                         self.t_disthome.set("--")
                 except Exception:
-                    self.t_lat.set("--"); self.t_lon.set("--")
                     self.t_disthome.set("--")
 
             if t == "VFR_HUD":
@@ -1085,32 +1043,6 @@ class FakeSticks:
                     self.t_wpdist.set(f"{dwp:.2f}" if dwp > 0 else "--")
                 except Exception:
                     self.t_wpdist.set("--")
-
-            # GPS primary
-            if t == "GPS_RAW_INT":
-                try:
-                    self.t_fix.set(_fix_type_to_str(getattr(msg, "fix_type", None)))
-                except Exception:
-                    self.t_fix.set("--")
-                try:
-                    sats = getattr(msg, "satellites_visible", None)
-                    self.t_sats.set(str(int(sats)) if sats is not None else "--")
-                except Exception:
-                    self.t_sats.set("--")
-                try:
-                    self.t_hdop.set(_dop_from_raw(getattr(msg, "eph", None)))
-                    self.t_vdop.set(_dop_from_raw(getattr(msg, "epv", None)))
-                except Exception:
-                    pass
-
-            # GPS secondary (optional log)
-            if t == "GPS2_RAW":
-                try:
-                    if (time.time() % 5.0) < 0.02:
-                        print(f"[GPS2] fix={_fix_type_to_str(msg.fix_type)} sats={msg.satellites_visible} "
-                              f"HDOP={_dop_from_raw(msg.eph)} VDOP={_dop_from_raw(getattr(msg, 'epv', 0))}")
-                except Exception:
-                    pass
 
     # ---------- Visual forward helpers ----------
     def _vs_pitch_from_area(self, area_frac: float) -> int:
@@ -1149,7 +1081,29 @@ class FakeSticks:
         try:
             model = _YOLO(YOLO_MODEL_NAME)
         except Exception as e:
-            print("YOLO load failed:", e); self.yolo_status.set("YOLO: load failed"); self.yolo_enabled=False; return
+            print("YOLO load failed:", e);
+            self.yolo_status.set("YOLO: load failed");
+            self.yolo_enabled = False;
+            return
+
+        # ---- Force CPU (and guard against accidental CUDA use) ----
+        try:
+            import os, torch
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""  # disable GPU for this process
+            try:
+                torch.backends.cudnn.enabled = False  # extra safety
+            except Exception:
+                pass
+            model.to("cpu")
+            try:
+                # some ultralytics versions expose .model, others wrap it
+                if hasattr(model, "model"):
+                    model.model.float()
+            except Exception:
+                pass
+            print("[YOLO] using CPU (float32)")
+        except Exception as e:
+            print("[YOLO] CPU setup warning:", e)
 
         # Resolve target class IDs from CLI names/ids
         global TARGET_CLASS_IDS
@@ -1163,24 +1117,15 @@ class FakeSticks:
                     print(f"[CLASSES] requested {TARGET_CLASSES} -> none matched, tracking ALL classes")
             else:
                 if isinstance(names, dict):
-                    human = [f"{i}:{names.get(i,'?')}" for i in sorted(TARGET_CLASS_IDS)]
+                    human = [f"{i}:{names.get(i, '?')}" for i in sorted(TARGET_CLASS_IDS)]
                 else:
                     human = [str(i) for i in sorted(TARGET_CLASS_IDS)]
                 print("[CLASSES] tracking only IDs:", ", ".join(human))
         except Exception:
             pass
 
-        # Try CUDA/Half if available (best effort; safe to fail)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                model.to("cuda")
-                try:
-                    model.model.half()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # NOTE: removed CUDA/half attempt. We run CPU-only to avoid
+        # "no kernel image is available" on the RTX 5070 Ti Laptop.
 
         # Open camera
         if sys.platform.startswith("win"):
@@ -1521,6 +1466,42 @@ class FakeSticks:
             self._send_guided_position(lat, lon, new_tgt); time.sleep(0.05)
         self._enable_guided_keepalive(lat, lon, new_tgt)
         print(f"[GUIDED] Target altitude -> {new_tgt:.2f} m (relative, keepalive). RC3 capped at {THR_SAFE_MAX} while hold active.")
+
+    # ---------- GUIDED Go-To ----------
+    def go_to_gps(self, lat_deg: float, lon_deg: float, alt_rel_m: float):
+        """
+        Send a GUIDED position target (GLOBAL_RELATIVE_ALT_INT) and enable keepalive.
+        Requires good GPS/EKF and GUIDED mode allowed on FC.
+        """
+        try:
+            self.set_mode("GUIDED")
+            for _ in range(5):
+                self._send_guided_position(float(lat_deg), float(lon_deg), float(alt_rel_m))
+                time.sleep(0.05)
+            self._enable_guided_keepalive(float(lat_deg), float(lon_deg), float(alt_rel_m))
+            self.alt_tgt.set(round(float(alt_rel_m), 2))
+            print(f"[GUIDED] Go-to -> lat={lat_deg:.7f}, lon={lon_deg:.7f}, alt_rel={alt_rel_m:.2f} m (keepalive on)")
+        except Exception as e:
+            messagebox.showerror("GUIDED", f"Go-to failed: {e}")
+
+    def prompt_go_to(self):
+        """
+        Simple dialog to ask for lat/lon/alt and call go_to_gps().
+        """
+        try:
+            lat = simpledialog.askfloat("Go To", "Latitude (deg):", parent=self.root)
+            if lat is None:
+                return
+            lon = simpledialog.askfloat("Go To", "Longitude (deg):", parent=self.root)
+            if lon is None:
+                return
+            default_alt = float(self._alt_val) if (self._alt_val is not None) else 10.0
+            alt = simpledialog.askfloat("Go To", "Altitude AGL (m):", initialvalue=round(default_alt, 2), parent=self.root)
+            if alt is None:
+                return
+            self.go_to_gps(float(lat), float(lon), float(alt))
+        except Exception as e:
+            messagebox.showerror("GUIDED", f"Input error: {e}")
 
     # ---------- Emergency Stop (async) ----------
     def emergency_stop_async(self):

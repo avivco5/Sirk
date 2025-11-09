@@ -1,1 +1,1 @@
-C:\Users\Aviv\PycharmProjects\81\Drone\logs\gps_log_2025-10-28_23-28-35.csv
+C:\Users\avivc\PycharmProjects\81\Drone\logs\gps_log_2025-11-09_15-25-26.csv

@@ -3,7 +3,7 @@
 """
 ASCII-only, english comments
 
-Hybrid GUI Tracker:
+Hybrid GUI Tracker (merged 2-16):
 - YOLOv8 detection
 - DeepSORT (Kalman + ReID) for robust identity memory and motion prediction
 - PD yaw controller with gain scheduling + deadband + low-pass on dx
@@ -11,26 +11,67 @@ Hybrid GUI Tracker:
 - Gentle throttle compensation when moving forward
 - Lost-target scan (sin sweep)
 - Alt-Hold helper (RC pulses) + Baro Alt-Hold closed loop
-- GUIDED "hold here" keepalive (relative alt) + +/- bumps
+- GUIDED "hold here" keepalive (relative alt) + +/- bumps + Go-To GPS target
 - Emergency Stop routine (neutral sticks, BRAKE fallback, LOITER)
 - Compact Tkinter UI + PS4 joystick mapping
 - Optional OpenCV preview and/or MJPEG web server
-- GPS panel: lat/lon, fix type, satellites, HDOP/VDOP
+
+New merged features (items 2-16):
+2) JSON load/save runtime profile + buttons
+3) Keyboard hotkeys for RC nudges and ESC to stop YOLO
+4) Rotating log to file (hybrid.log)
+5) Battery low beeper via CH5
+6) Auto-reconnect MAVLink on drop
+7) Health panel basics (GPS fix/sats)
+8) FPS limiter when window hidden
+9) Telemetry CSV recorder toggle
+10) Safe-arm gate (modes + cooldown)
+11) GUI toggle for auto throttle minimum while tracking
+12) Camera index fallback scan
+13) Live class filter entry
+14) UDP publish of target bbox
+15) Safe window close if ARMED (confirmation)
+16) CLI presets (rpi-lite, laptop-cpu, cam-hires)
 
 Notes:
 - Keep comments ascii-only.
-- This script depends on: ultralytics, opencv-python, deep-sort-realtime, pygame, pymavlink, flask (if web).
-- For DeepSORT embedder, mobilenet is used by default. You can change to other embedders if installed.
+- This script depends on: ultralytics, opencv-python, deep-sort-realtime, pygame, pymavlink, flask (optional).
 """
 
 import sys, glob
+from serial.tools import list_ports
 import math, time, threading, queue, re, os
 import argparse
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter import font as tkfont
+from tkinter import simpledialog
+import warnings
+import json, socket, subprocess  # for UDP control and external process
+import pathlib
+import logging, logging.handlers
 
-# Numpy must be imported before some trackers; also patch legacy aliases
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# --- simple ENV getters (ascii-only) ---
+def _get_env_str(name, default=None):
+    try:
+        v = os.environ.get(str(name), None)
+        return str(v) if v is not None else default
+    except Exception:
+        return default
+
+def _get_env_int(name, default=None):
+    try:
+        v = os.environ.get(str(name), None)
+        return int(v) if v is not None else default
+    except Exception:
+        return default
+
+# map/ctrl defaults
+MAP_UDP_IP_DEFAULT = "127.0.0.1"
+
+# Numpy import and alias patch
 import numpy as np
 if not hasattr(np, "float"): np.float = float
 if not hasattr(np, "int"):   np.int   = int
@@ -63,6 +104,21 @@ except Exception as e:
 
 from pymavlink import mavutil
 
+# ---------------- Logger (item 4) ----------------
+def _init_logger():
+    logger = logging.getLogger("hybrid")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fh = logging.handlers.RotatingFileHandler("hybrid.log", maxBytes=2_000_000, backupCount=3)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+LOGGER = _init_logger()
 
 # ---------------- Compact UI Settings ----------------
 UI_SCALE = 0.90
@@ -71,7 +127,7 @@ PADDING = 6
 INNER_PAD = 4
 LABEL_WIDTH = 12
 VALUE_WIDTH = 4
-GEOMETRY = "1120x920"
+GEOMETRY = "1120x900"
 
 # ---------------- Serial auto-detect ----------------
 if sys.platform.startswith("linux"):
@@ -79,20 +135,33 @@ if sys.platform.startswith("linux"):
     DEVICE = cands[0] if cands else "/dev/ttyACM0"
     BAUD = 115200
 else:
-    DEVICE = "COM4"
+    DEVICE = None
+    for p in list_ports.comports():
+        name = (p.description or "").lower()
+        if "mavlink" in name:
+            DEVICE = p.device
+            print(f"[AUTO] Found MAVLink device: {p.device} ({p.description})")
+            break
+    if DEVICE is None:
+        print("[WARN] No MAVLink port found, defaulting to COM4")
+        DEVICE = "COM4"
     BAUD = 115200
 
 # ---------------- Joystick Mapping ----------------
-# Linux (RPi) PS4 axis mapping:
 LINUX_AXIS_ROLL  = 3
 LINUX_AXIS_PITCH = 4  # inverted
 LINUX_AXIS_YAW   = 0
 LINUX_AXIS_THR   = 1  # inverted
-# Windows mapping:
 WIN_AXIS_ROLL  = 2
 WIN_AXIS_PITCH = 3  # inverted
 WIN_AXIS_YAW   = 0
 WIN_AXIS_THR   = 1  # inverted
+
+# --- Tracking env defaults ---
+TRACK_MODE     = (_get_env_str("TRACK_MODE", "udp") or "udp").lower()  # "udp", "external", "local"
+TRACK_UDP_IP   = _get_env_str("TRACK_UDP_IP", MAP_UDP_IP_DEFAULT)
+TRACK_UDP_PORT = _get_env_int("TRACK_UDP_PORT", 9003)
+TRACK_CMD      = _get_env_str("TRACK_CMD", "python hybrid_tracker.py --no-window")
 
 if sys.platform.startswith("linux"):
     AXIS_ROLL, AXIS_PITCH, AXIS_YAW, AXIS_THR = LINUX_AXIS_ROLL, LINUX_AXIS_PITCH, LINUX_AXIS_YAW, LINUX_AXIS_THR
@@ -121,31 +190,30 @@ YOLO_DB_PIX      = 40
 YOLO_THR_MIN     = 1150
 YOLO_SHOW_WINDOW = True
 YOLO_CAM_INDEX   = 0
-YOLO_MODEL_NAME  = "yolov8n.pt"   # can be overridden by CLI
-YOLO_CONF        = 0.20           # overridden by CLI
+YOLO_MODEL_NAME  = "yolov8n.pt"
+YOLO_CONF        = 0.20
 YOLO_IOU         = 0.50
 DRAW_CONF_MIN    = 0.60
 
 # Inference downscale for RPi (map back boxes to original size)
-DET_DOWNSCALE    = 0.67  # set to 1.0 to disable
+DET_DOWNSCALE    = 0.67
 
 # --------- Class filter (CLI override) ----------
-# Default: track "person" (RPi-friendly). Pass --classnames to override.
 TARGET_CLASSES   = ["person"]
-TARGET_CLASS_IDS = None  # will be resolved after model loads
+TARGET_CLASS_IDS = None
 
 # ---------------- DeepSORT tuning ----------------
 DS_MAX_AGE       = 45
 DS_N_INIT        = 3
 DS_MAX_IOU       = 0.7
 DS_NN_BUDGET     = 100
-DS_EMBEDDER      = "mobilenet"   # or "osnet_x0_25" if installed
+DS_EMBEDDER      = "mobilenet"
 DS_HALF          = True
 
 # ---------------- Lost-target scan ----------------
 LOST_TIMEOUT_S   = 1.0
 SCAN_PERIOD_S    = 3.5
-SCAN_AMPL_RC     = 140    # +/- microseconds around center
+SCAN_AMPL_RC     = 140
 
 # ---------------- Altitude handling ----------------
 ALT_SOURCE_HOLD_S = 1.5
@@ -176,7 +244,7 @@ VS_MAX_RC_DELTA    = 220
 VS_LP_ALPHA        = 0.18
 VS_PITCH_FORWARD_SIGN = -1  # negative: move forward when area is small
 
-# Optional small throttle compensation (gentler defaults)
+# Optional small throttle compensation (gentle)
 VS_THR_COMP_GAIN_US = 60
 VS_THR_COMP_MAX_US  = 100
 
@@ -200,22 +268,30 @@ VS_YAW_OK_PIX_DEFAULT       = 40
 NEAR_STOP_AREA_FRAC_DEFAULT = 0.120
 FAR_STOP_AREA_FRAC_DEFAULT  = 0.0015
 
+# ---------------- Profiles (item 2) ----------------
+PROFILE_PATH = pathlib.Path("hybrid_profile.json")
 
-# ================= Utility funcs =================
+# ---------------- Recorder (item 9) ----------------
+REC_PATH = pathlib.Path("telemetry.csv")
+
+# ---------------- PUB UDP for bbox (item 14) ----------------
+PUB_UDP_IP = _get_env_str("PUB_UDP_IP", "127.0.0.1")
+PUB_UDP_PORT = _get_env_int("PUB_UDP_PORT", 9103)
+
+# ---------------- FPS limiter when hidden (item 8) ----------------
+MAX_FPS_NO_WINDOW = 15.0
+
+# ---------------- Utility funcs ----------------
 def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
 def apply_deadzone(val, dz=DEADZONE): return 0.0 if abs(val) < dz else val
 
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
-    a1, b1 = math.to_radians(lat1), math.to_radians(lon1)
-    a2, b2 = math.to_radians(lat2), math.to_radians(lon2)
+    a1, b1 = math.radians(lat1), math.radians(lon1)
+    a2, b2 = math.radians(lat2), math.radians(lon2)
     da, db = a2 - a1, b2 - b1
     h = math.sin(da/2)**2 + math.cos(a1)*math.cos(a2)*math.sin(db/2)**2
     return 2 * R * math.asin(math.sqrt(h))
-
-# python 3.8 compatibility shim (no math.to_radians)
-if not hasattr(math, "to_radians"):
-    math.to_radians = math.radians
 
 def _param_id_to_str(pid):
     if isinstance(pid, (bytes, bytearray)):
@@ -243,33 +319,6 @@ def _rad2deg_wrap(rad: float) -> float:
 def _norm_name(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
-# --- GPS helpers ---
-def _fix_type_to_str(ft):
-    try: ft = int(ft)
-    except Exception: return "--"
-    return {
-        0: "NO-GPS",
-        1: "NO-FIX",
-        2: "2D",
-        3: "3D",
-        4: "DGPS",
-        5: "RTK-FIX",
-        6: "RTK-FLOAT",
-        7: "STATIC",
-        8: "PPP"
-    }.get(ft, str(ft))
-
-def _dop_from_raw(raw):
-    try:
-        v = float(raw)
-        if v <= 0: return "--"
-        if v > 50:   # treat as x100 scaled
-            return f"{(v/100.0):.2f}"
-        return f"{v:.2f}"
-    except Exception:
-        return "--"
-
-
 # ---- CLI helpers ----
 def _normalize_classnames_arg(arg):
     # supports: ["person","car"] or ["person,car"] or IDs like ["0","2"]
@@ -280,11 +329,10 @@ def _normalize_classnames_arg(arg):
 
 def _resolve_class_ids(model, wanted):
     # wanted: list[str|int] or None -> returns set[int] or None
-    if wanted is None:  # None => all classes
+    if wanted is None:
         return None
     if isinstance(wanted, (list, tuple)) and len(wanted) == 0:
         return None
-    # map model names
     id2name = {}
     try:
         names = model.names if hasattr(model, "names") else None
@@ -308,16 +356,76 @@ def _parse_args():
     p.add_argument("--tracker", choices=["deepsort", "bytetrack"], default="deepsort",
                    help="tracking backend (bytetrack falls back to deepsort in this build)")
     p.add_argument("--classnames", nargs="+", default=None,
-                   help="target classes by names or IDs. Examples: person car  or  0 2. "
-                        "Multiple tokens or a single comma-separated string are OK.")
+                   help="target classes by names or IDs (e.g. person car or 0 2).")
     p.add_argument("--yolo-model", default="yolov8n.pt", help="YOLOv8 model path/name")
     p.add_argument("--det-downscale", type=float, default=0.67, help="inference downscale (0.2..1.0)")
     p.add_argument("--conf", type=float, default=0.20, help="YOLO confidence threshold")
     p.add_argument("--iou", type=float, default=0.50, help="YOLO NMS IoU threshold")
     p.add_argument("--cam-index", type=int, default=0, help="OpenCV camera index")
     p.add_argument("--no-window", action="store_true", help="disable OpenCV preview window")
+    # item 16: presets
+    p.add_argument("--preset", choices=["rpi-lite","laptop-cpu","cam-hires"], default=None,
+                   help="quick preset for conf/iou/downscale")
     return p.parse_args()
 
+# ================= CPU-only DeepSORT helper =================
+def _make_deepsort_cpu():
+    """
+    Create a DeepSort instance that never touches CUDA, regardless of local GPU.
+    """
+    try:
+        import torch
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        try:
+            torch.backends.cudnn.enabled = False
+        except Exception:
+            pass
+        try:
+            torch.cuda.is_available = lambda: False
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    from deep_sort_realtime.deepsort_tracker import DeepSort
+
+    try:
+        return DeepSort(
+            max_age=DS_MAX_AGE,
+            n_init=DS_N_INIT,
+            max_iou_distance=DS_MAX_IOU,
+            nn_budget=DS_NN_BUDGET,
+            nms_max_overlap=1.0,
+            embedder=DS_EMBEDDER,
+            half=False,
+            embedder_gpu=False,
+            bgr=True
+        )
+    except TypeError:
+        try:
+            return DeepSort(
+                max_age=DS_MAX_AGE,
+                n_init=DS_N_INIT,
+                max_iou_distance=DS_MAX_IOU,
+                nn_budget=DS_NN_BUDGET,
+                nms_max_overlap=1.0,
+                embedder=DS_EMBEDDER,
+                half=False,
+                use_cuda=False,
+                bgr=True
+            )
+        except TypeError:
+            return DeepSort(
+                max_age=DS_MAX_AGE,
+                n_init=DS_N_INIT,
+                max_iou_distance=DS_MAX_IOU,
+                nn_budget=DS_NN_BUDGET,
+                nms_max_overlap=1.0,
+                embedder=DS_EMBEDDER,
+                half=False,
+                cpu=True,
+                bgr=True
+            )
 
 # ================= MJPEG Web Server (optional) =================
 class MJPEGServer:
@@ -364,7 +472,6 @@ class MJPEGServer:
             except: pass
         self.frame_q.put(jpg.tobytes())
 
-
 # ================= Main GUI class =================
 class FakeSticks:
     def __init__(self, root):
@@ -390,6 +497,20 @@ class FakeSticks:
             self.m = mavutil.mavlink_connection(DEVICE, baud=BAUD)
             self.m.wait_heartbeat(timeout=5)
             ttk.Label(root, text=f"Connected: sys {self.m.target_system}, comp {self.m.target_component}").pack()
+
+            # Tracking control state and UDP control socket
+            self.tracking_active = tk.BooleanVar(value=False)
+            self.track_status = tk.StringVar(value="Tracking: idle")
+
+            # separate UDP control channel (for external tracker listener)
+            try:
+                self._ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._ctrl_dst = (TRACK_UDP_IP, int(TRACK_UDP_PORT))
+            except Exception as e:
+                self._ctrl_sock = None
+                self._ctrl_dst = None
+                print("[TRACK-UDP] socket init failed:", e)
+
             try:
                 self.m.mav.command_long_send(
                     self.m.target_system, self.m.target_component,
@@ -397,18 +518,11 @@ class FakeSticks:
                 )
             except Exception:
                 pass
-            # message rates
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_ALTITUDE,            10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 10)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD,              5)
             self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,           1)
-            # GPS message rates
-            self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT,          5)
-            try:
-                self._set_msg_rate(mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW,         5)
-            except Exception:
-                pass
         except Exception as e:
             messagebox.showerror("MAVLink", f"Connect failed: {e}")
             root.destroy(); return
@@ -457,13 +571,8 @@ class FakeSticks:
         self.t_yaw   = tk.StringVar(value="--")
         self._att_ts = 0.0
 
-        # GPS UI vars
-        self.t_lat  = tk.StringVar(value="--")
-        self.t_lon  = tk.StringVar(value="--")
-        self.t_fix  = tk.StringVar(value="--")
-        self.t_sats = tk.StringVar(value="--")
-        self.t_hdop = tk.StringVar(value="--")
-        self.t_vdop = tk.StringVar(value="--")
+        # Health (item 7)
+        self.t_health = tk.StringVar(value="--")
 
         # Position / altitude buffers
         self._cur_latlon  = None
@@ -538,14 +647,9 @@ class FakeSticks:
         self._mk_metric(tele, "3D Speed (m/s)",    self.t_speed3d)
         self._mk_metric(tele, "DistToHome (m)",    self.t_disthome)
 
-        # GPS panel
-        gpsf = ttk.LabelFrame(root, text="GPS", padding=PADDING); gpsf.pack(fill="x", padx=PADDING, pady=INNER_PAD)
-        self._mk_metric(gpsf, "Lat (deg)",  self.t_lat)
-        self._mk_metric(gpsf, "Lon (deg)",  self.t_lon)
-        self._mk_metric(gpsf, "Fix",        self.t_fix)
-        self._mk_metric(gpsf, "Satellites", self.t_sats)
-        self._mk_metric(gpsf, "HDOP",       self.t_hdop)
-        self._mk_metric(gpsf, "VDOP",       self.t_vdop)
+        # Health panel (item 7)
+        hlf = ttk.LabelFrame(root, text="Health", padding=PADDING); hlf.pack(fill="x", padx=PADDING, pady=INNER_PAD)
+        self._mk_metric(hlf, "Status", self.t_health, font_size=18)
 
         ly = ttk.LabelFrame(root, text="YOLO + DeepSORT (Yaw + Forward)", padding=PADDING); ly.pack(fill="x", padx=PADDING, pady=INNER_PAD)
         self.yolo_enabled = False
@@ -557,34 +661,61 @@ class FakeSticks:
         ttk.Button(ly, text="Stop",  command=self.stop_yolo).pack(side="left", padx=INNER_PAD)
         ttk.Checkbutton(ly, text="Forward from size (Pitch)", variable=self.vs_pitch_en).pack(side="left", padx=INNER_PAD)
         ttk.Checkbutton(ly, text="Throttle comp", variable=self.vs_thr_comp_en).pack(side="left", padx=INNER_PAD)
+        # item 11: auto throttle min toggle
+        self.auto_thr_min = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ly, text="Auto throttle min", variable=self.auto_thr_min).pack(side="left", padx=INNER_PAD)
 
-        # ---- Live Tunables ----
+        # item 13: live class filter entry
+        frm_cls = ttk.Frame(ly); frm_cls.pack(side="left", padx=INNER_PAD)
+        ttk.Label(frm_cls, text="Classes:").pack(side="left")
+        self.cls_entry = ttk.Entry(frm_cls, width=16)
+        self.cls_entry.insert(0, ",".join(TARGET_CLASSES) if TARGET_CLASSES else "")
+        self.cls_entry.pack(side="left")
+        ttk.Button(frm_cls, text="Apply", command=self._apply_classes_live).pack(side="left", padx=INNER_PAD)
+
+        # Tracking control (external/local)
+        trk = ttk.LabelFrame(root, text="Tracking control", padding=PADDING)
+        trk.pack(fill="x", padx=PADDING, pady=INNER_PAD)
+        ttk.Label(trk, textvariable=self.track_status).pack(side="left", padx=INNER_PAD)
+        ttk.Button(trk, text="Start Tracking", command=self.btn_start_tracking).pack(side="left", padx=INNER_PAD)
+        ttk.Button(trk, text="Stop Tracking",  command=self.btn_stop_tracking ).pack(side="left", padx=INNER_PAD)
+
+        # Live Tunables
         tun = ttk.LabelFrame(root, text="Tracking Tunables (live)", padding=PADDING); tun.pack(fill="x", padx=PADDING, pady=INNER_PAD)
-
         self.kp_var   = tk.DoubleVar(value=YAW_KP_DEFAULT)
         self.kd_var   = tk.DoubleVar(value=YAW_KD_DEFAULT)
         self.yaw_ok_px_var = tk.DoubleVar(value=VS_YAW_OK_PIX_DEFAULT)
         self.far_area_var  = tk.DoubleVar(value=FAR_STOP_AREA_FRAC_DEFAULT)
         self.near_area_var = tk.DoubleVar(value=NEAR_STOP_AREA_FRAC_DEFAULT)
-
         self._mk_tunable(tun, "YAW_KP",  self.kp_var,   0.0, 1.5, 0.01, "{:.2f}")
         self._mk_tunable(tun, "YAW_KD",  self.kd_var,   0.0, 0.8,  0.01, "{:.2f}")
         self._mk_tunable(tun, "VS_YAW_OK_PIX", self.yaw_ok_px_var, 0.0, 200.0, 1.0, "{:.0f}")
-
         row_bounds = ttk.Frame(tun); row_bounds.pack(fill="x", pady=INNER_PAD)
         self._mk_tunable(row_bounds, "FAR_STOP_AREA_FRAC",  self.far_area_var,  0.000, 0.020, 0.001, "{:.3f}")
         self._mk_tunable(row_bounds, "NEAR_STOP_AREA_FRAC", self.near_area_var, 0.020, 0.300, 0.001, "{:.3f}")
-
         ttk.Button(tun, text="Reset to defaults", command=self._reset_tunables).pack(side="right", padx=INNER_PAD)
 
-        # Flight modes + Control buttons
+        # item 2: profile buttons
+        rowp = ttk.Frame(tun); rowp.pack(fill="x", pady=INNER_PAD)
+        ttk.Button(rowp, text="Save Profile", command=self.save_profile).pack(side="left", padx=INNER_PAD)
+        ttk.Button(rowp, text="Load Profile", command=self.load_profile).pack(side="left", padx=INNER_PAD)
+
+        # Flight modes + GUIDED helpers
         mf = ttk.LabelFrame(root, text="Flight Modes", padding=PADDING)
         mf.pack(fill="x", padx=PADDING, pady=INNER_PAD)
         ttk.Button(mf, text="GUIDED",    command=lambda: self.set_mode("GUIDED")).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
         ttk.Button(mf, text="STABILIZE", command=lambda: self.set_mode("STABILIZE")).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="Hold Here", command=self.hold_alt_guided_here).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="Go To…",    command=self.prompt_go_to).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="+1m",       command=lambda: self.bump_alt_guided(+1.0)).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+        ttk.Button(mf, text="-1m",       command=lambda: self.bump_alt_guided(-1.0)).pack(side="left", expand=True, fill="x", padx=INNER_PAD)
+
+        # Recorder toggle (item 9)
+        recf = ttk.Frame(root, padding=PADDING); recf.pack(fill="x")
+        self.rec_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(recf, text="Record telemetry CSV", variable=self.rec_enabled).pack(side="left", padx=INNER_PAD)
 
         btns = ttk.Frame(root, padding=PADDING); btns.pack(fill="x")
-
         # ARMED/DISARMED indicator
         self.arm_state = tk.StringVar(value="DISARMED")
         self.lbl_arm_state = tk.Label(btns, textvariable=self.arm_state,
@@ -614,6 +745,14 @@ class FakeSticks:
         # Joystick button edges
         self._js_prev = {0:0, 1:0, 3:0}
 
+        # PUB UDP (item 14)
+        try:
+            self._pub_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._pub_dst = (PUB_UDP_IP, int(PUB_UDP_PORT))
+        except Exception as e:
+            self._pub_sock = None; self._pub_dst = None
+            print("[PUB-UDP] init failed:", e)
+
         # Threads
         self.running = True
         threading.Thread(target=self._send_loop,             daemon=True).start()
@@ -622,6 +761,64 @@ class FakeSticks:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.geometry(GEOMETRY)
+
+        # Hotkeys (item 3)
+        self._bind_hotkeys()
+
+        # Load profile (item 2)
+        self.load_profile()
+
+    # ---------- Profile save/load (item 2) ----------
+    def save_profile(self):
+        try:
+            data = {
+                "kp": float(self.kp_var.get()),
+                "kd": float(self.kd_var.get()),
+                "yaw_ok_px": float(self.yaw_ok_px_var.get()),
+                "far_area": float(self.far_area_var.get()),
+                "near_area": float(self.near_area_var.get()),
+                "vs_pitch_en": bool(self.vs_pitch_en.get()),
+                "vs_thr_comp_en": bool(self.vs_thr_comp_en.get()),
+                "yolo_conf": float(YOLO_CONF),
+                "yolo_iou": float(YOLO_IOU),
+                "det_downscale": float(DET_DOWNSCALE),
+                "cam_index": int(YOLO_CAM_INDEX),
+                "auto_thr_min": bool(self.auto_thr_min.get())
+            }
+            PROFILE_PATH.write_text(json.dumps(data, indent=2))
+            print("[PROFILE] saved:", PROFILE_PATH)
+        except Exception as e:
+            print("[PROFILE] save error:", e)
+
+    def load_profile(self):
+        try:
+            if PROFILE_PATH.exists():
+                data = json.loads(PROFILE_PATH.read_text())
+                self.kp_var.set(float(data.get("kp", self.kp_var.get())))
+                self.kd_var.set(float(data.get("kd", self.kd_var.get())))
+                self.yaw_ok_px_var.set(float(data.get("yaw_ok_px", self.yaw_ok_px_var.get())))
+                self.far_area_var.set(float(data.get("far_area", self.far_area_var.get())))
+                self.near_area_var.set(float(data.get("near_area", self.near_area_var.get())))
+                self.vs_pitch_en.set(bool(data.get("vs_pitch_en", True)))
+                self.vs_thr_comp_en.set(bool(data.get("vs_thr_comp_en", True)))
+                self.auto_thr_min.set(bool(data.get("auto_thr_min", True)))
+                print("[PROFILE] loaded:", PROFILE_PATH)
+        except Exception as e:
+            print("[PROFILE] load error:", e)
+
+    # ---------- Hotkeys (item 3) ----------
+    def _bind_hotkeys(self):
+        self.root.bind("<Escape>", lambda e: self.stop_yolo())
+        def _nudge(var, delta):
+            v = int(var.get()) + int(delta)
+            var.set(clamp(v, RC_MIN, RC_MAX))
+            self._send_override()
+        self.root.bind("<Key-q>", lambda e: _nudge(self.yaw, -25))
+        self.root.bind("<Key-e>", lambda e: _nudge(self.yaw, +25))
+        self.root.bind("<Key-w>", lambda e: _nudge(self.pitch, -25))
+        self.root.bind("<Key-s>", lambda e: _nudge(self.pitch, +25))
+        self.root.bind("<Key-a>", lambda e: _nudge(self.roll, -25))
+        self.root.bind("<Key-d>", lambda e: _nudge(self.roll, +25))
 
     # ---------- ARM UI ----------
     def _set_arm_state_ui(self, armed: bool):
@@ -967,30 +1164,65 @@ class FakeSticks:
                 except Exception as e:
                     print("[PS4] joystick error:", e); self.js = None
 
+            # item 5: battery guard beeper on CH5
+            self._battery_guard()
+
             self._send_override()
             time.sleep(per)
 
-    # ---------- Telemetry RX ----------
-    def _consider_alt(self, value, src):
-        if value is None: return
+    # ---------- Battery guard (item 5) ----------
+    # Example thresholds for 6S; tune to your pack or compute from cells
+    BATT_LOW_V = 3.55 * 6.0
+    BATT_CRIT_V = 3.45 * 6.0
+
+    def _battery_guard(self):
         try:
-            val = float(value)
+            vtxt = self.batt_v.get().split()[0]
+            v = float(vtxt)
+            if v <= self.BATT_CRIT_V:
+                self.servo5.set(1900)  # continuous alarm
+            elif v <= self.BATT_LOW_V:
+                self.servo5.set(1700)  # slow beep
+            else:
+                self.servo5.set(1500)
         except Exception:
-            return
-        now = time.time()
-        cur_pri = self._priority.get(self._alt_src or '', 0)
-        new_pri = self._priority.get(src, 0)
-        if new_pri < cur_pri and (now - self._alt_ts) < ALT_SOURCE_HOLD_S:
-            return
-        self._alt_src = src; self._alt_ts = now; self._alt_val = val
-        self.t_alt.set(f"{val:.2f}")
+            pass
+
+    # ---------- Telemetry RX with reconnect (items 6,7,9) ----------
+    def _mav_reconnect(self):
+        try:
+            self.m.close()
+        except Exception:
+            pass
+        for _ in range(3):
+            try:
+                self.m = mavutil.mavlink_connection(DEVICE, baud=BAUD)
+                self.m.wait_heartbeat(timeout=5)
+                print("[MAV] reconnected")
+                return True
+            except Exception as e:
+                print("[MAV] reconnect failed:", e)
+                time.sleep(1.0)
+        return False
+
+    def _record_line(self, d):
+        try:
+            new = not REC_PATH.exists()
+            with REC_PATH.open("a", encoding="utf-8") as f:
+                if new:
+                    f.write(",".join(d.keys()) + "\n")
+                f.write(",".join(str(d[k]) for k in d.keys()) + "\n")
+        except Exception as e:
+            print("[REC] write error:", e)
 
     def _mav_telemetry(self):
         while self.running:
             try:
                 msg = self.m.recv_match(blocking=False)
             except Exception:
-                time.sleep(0.01); continue
+                if self._mav_reconnect():
+                    continue
+                time.sleep(0.5); continue
             if not msg:
                 time.sleep(0.005); continue
 
@@ -1002,6 +1234,15 @@ class FakeSticks:
                     if armed_flag != self.is_armed:
                         self.is_armed = armed_flag
                         self._set_arm_state_ui(self.is_armed)
+                except Exception:
+                    pass
+
+            if t == "GPS_RAW_INT":
+                try:
+                    fix = int(msg.fix_type)
+                    sats = int(msg.satellites_visible)
+                    text = f"GPS:fix={fix} sats={sats}"
+                    self.t_health.set(text)
                 except Exception:
                     pass
 
@@ -1044,19 +1285,13 @@ class FakeSticks:
                     pass
                 try:
                     self._cur_latlon = (msg.lat/1e7, msg.lon/1e7)
-                    if self._cur_latlon and all(self._cur_latlon):
-                        self.t_lat.set(f"{self._cur_latlon[0]:.7f}")
-                        self.t_lon.set(f"{self._cur_latlon[1]:.7f}")
-                    else:
-                        self.t_lat.set("--"); self.t_lon.set("--")
-                    if self._home_latlon and self._cur_latlon and all(self._cur_latlon):
+                    if self._home_latlon and all(self._cur_latlon):
                         d = haversine_m(self._home_latlon[0], self._home_latlon[1],
                                         self._cur_latlon[0],  self._cur_latlon[1])
                         self.t_disthome.set(f"{d:.2f}")
                     else:
                         self.t_disthome.set("--")
                 except Exception:
-                    self.t_lat.set("--"); self.t_lon.set("--")
                     self.t_disthome.set("--")
 
             if t == "VFR_HUD":
@@ -1086,31 +1321,38 @@ class FakeSticks:
                 except Exception:
                     self.t_wpdist.set("--")
 
-            # GPS primary
-            if t == "GPS_RAW_INT":
+            # item 9: recorder (coalesce once per loop)
+            if self.rec_enabled.get():
                 try:
-                    self.t_fix.set(_fix_type_to_str(getattr(msg, "fix_type", None)))
-                except Exception:
-                    self.t_fix.set("--")
-                try:
-                    sats = getattr(msg, "satellites_visible", None)
-                    self.t_sats.set(str(int(sats)) if sats is not None else "--")
-                except Exception:
-                    self.t_sats.set("--")
-                try:
-                    self.t_hdop.set(_dop_from_raw(getattr(msg, "eph", None)))
-                    self.t_vdop.set(_dop_from_raw(getattr(msg, "epv", None)))
+                    d = {
+                        "ts": round(time.time(), 3),
+                        "alt": self._alt_val if self._alt_val is not None else "",
+                        "roll": self.t_roll.get(),
+                        "pitch": self.t_pitch.get(),
+                        "yaw": self.t_yaw.get(),
+                        "gspeed": self.t_gspeed.get(),
+                        "rc1": int(self.roll.get()),
+                        "rc2": int(self.pitch.get()),
+                        "rc3": int(self.thr.get()),
+                        "rc4": int(self.yaw.get()),
+                    }
+                    self._record_line(d)
                 except Exception:
                     pass
 
-            # GPS secondary (optional log)
-            if t == "GPS2_RAW":
-                try:
-                    if (time.time() % 5.0) < 0.02:
-                        print(f"[GPS2] fix={_fix_type_to_str(msg.fix_type)} sats={msg.satellites_visible} "
-                              f"HDOP={_dop_from_raw(msg.eph)} VDOP={_dop_from_raw(getattr(msg, 'epv', 0))}")
-                except Exception:
-                    pass
+    def _consider_alt(self, value, src):
+        if value is None: return
+        try:
+            val = float(value)
+        except Exception:
+            return
+        now = time.time()
+        cur_pri = self._priority.get(self._alt_src or '', 0)
+        new_pri = self._priority.get(src, 0)
+        if new_pri < cur_pri and (now - self._alt_ts) < ALT_SOURCE_HOLD_S:
+            return
+        self._alt_src = src; self._alt_ts = now; self._alt_val = val
+        self.t_alt.set(f"{val:.2f}")
 
     # ---------- Visual forward helpers ----------
     def _vs_pitch_from_area(self, area_frac: float) -> int:
@@ -1125,7 +1367,7 @@ class FakeSticks:
         self._vs_pitch_rc = rc2
         return rc2
 
-    # ---------- YOLO + DeepSORT (optional) ----------
+    # ---------- YOLO + DeepSORT ----------
     def start_yolo(self):
         if not YOLO_OK:
             messagebox.showwarning("YOLO", "YOLO/Camera not available"); return
@@ -1144,14 +1386,117 @@ class FakeSticks:
         self._vs_pitch_rc = int(self._vs_pitch_rc + 0.7*(RC_MID - self._vs_pitch_rc))
         self.pitch.set(self._vs_pitch_rc)
 
+    # ---------- Tracking control helpers ----------
+    def _send_track_cmd(self, cmd: str):
+        if not self._ctrl_sock or not self._ctrl_dst:
+            print("[TRACK-UDP] socket not ready")
+            return
+        try:
+            payload = json.dumps({"cmd": str(cmd)}).encode("utf-8")
+            self._ctrl_sock.sendto(payload, self._ctrl_dst)
+            print(f"[TRACK-UDP] sent '{cmd}' -> {self._ctrl_dst}")
+        except Exception as e:
+            print("[TRACK-UDP] send failed:", e)
+
+    def btn_start_tracking(self):
+        if self.tracking_active.get():
+            print("[TRACK] already active")
+            return
+        mode = (TRACK_MODE or "udp").lower()
+        try:
+            if mode == "udp":
+                self._send_track_cmd("start_tracking")
+                self.tracking_active.set(True)
+                self.track_status.set(f"Tracking: active (UDP {TRACK_UDP_IP}:{TRACK_UDP_PORT})")
+            elif mode == "external":
+                self._track_proc = subprocess.Popen(TRACK_CMD, shell=True)
+                self.tracking_active.set(True)
+                pid = self._track_proc.pid if self._track_proc else None
+                self.track_status.set(f"Tracking: active (external) pid={pid}")
+                print(f"[TRACK-EXT] started: {TRACK_CMD} (pid={pid})")
+            elif mode == "local":
+                self.tracking_active.set(True)
+                self.track_status.set("Tracking: active (local)")
+                print("[TRACK-LOCAL] active")
+            else:
+                print(f"[TRACK] unknown TRACK_MODE='{TRACK_MODE}', fallback to UDP")
+                self._send_track_cmd("start_tracking")
+                self.tracking_active.set(True)
+                self.track_status.set(f"Tracking: active (UDP {TRACK_UDP_IP}:{TRACK_UDP_PORT})")
+        except Exception as e:
+            print("[TRACK] start failed:", e)
+
+    def btn_stop_tracking(self):
+        mode = (TRACK_MODE or "udp").lower()
+        try:
+            if mode == "udp":
+                self._send_track_cmd("stop_tracking")
+            elif mode == "external":
+                if hasattr(self, "_track_proc") and self._track_proc and (self._track_proc.poll() is None):
+                    try:
+                        self._track_proc.terminate()
+                        print(f"[TRACK-EXT] terminated pid={self._track_proc.pid}")
+                    except Exception as e:
+                        print("[TRACK-EXT] terminate error:", e)
+                self._track_proc = None
+            elif mode == "local":
+                print("[TRACK-LOCAL] stopped")
+        except Exception as e:
+            print("[TRACK] stop failed:", e)
+        finally:
+            self.tracking_active.set(False)
+            self.track_status.set("Tracking: idle")
+
+    def _open_camera(self, index):
+        if sys.platform.startswith("win"):
+            return cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        return cv2.VideoCapture(index)
+
+    def _publish_bbox(self, bbox, conf, area, dx, src):
+        if not self._pub_sock or not self._pub_dst: return
+        try:
+            x1,y1,x2,y2 = bbox
+            payload = {
+                "ts": time.time(),
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "conf": float(conf) if conf is not None else None,
+                "area_frac": float(area) if area is not None else None,
+                "dx": float(dx) if dx is not None else None,
+                "src": str(src or "")
+            }
+            self._pub_sock.sendto(json.dumps(payload).encode("utf-8"), self._pub_dst)
+        except Exception as e:
+            print("[PUB-UDP] send err:", e)
+
     def _yolo_loop(self):
         # Load YOLO
         try:
             model = _YOLO(YOLO_MODEL_NAME)
         except Exception as e:
-            print("YOLO load failed:", e); self.yolo_status.set("YOLO: load failed"); self.yolo_enabled=False; return
+            print("YOLO load failed:", e)
+            self.yolo_status.set("YOLO: load failed")
+            self.yolo_enabled = False
+            return
 
-        # Resolve target class IDs from CLI names/ids
+        # Force CPU (avoid invalid GPU kernel)
+        try:
+            import torch
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            try:
+                torch.backends.cudnn.enabled = False
+            except Exception:
+                pass
+            model.to("cpu")
+            try:
+                if hasattr(model, "model"):
+                    model.model.float()
+            except Exception:
+                pass
+            print("[YOLO] using CPU (float32)")
+        except Exception as e:
+            print("[YOLO] CPU setup warning:", e)
+
+        # Resolve target class IDs from global TARGET_CLASSES (or live)
         global TARGET_CLASS_IDS
         TARGET_CLASS_IDS = _resolve_class_ids(model, TARGET_CLASSES)
         try:
@@ -1163,51 +1508,42 @@ class FakeSticks:
                     print(f"[CLASSES] requested {TARGET_CLASSES} -> none matched, tracking ALL classes")
             else:
                 if isinstance(names, dict):
-                    human = [f"{i}:{names.get(i,'?')}" for i in sorted(TARGET_CLASS_IDS)]
+                    human = [f"{i}:{names.get(i, '?')}" for i in sorted(TARGET_CLASS_IDS)]
                 else:
                     human = [str(i) for i in sorted(TARGET_CLASS_IDS)]
                 print("[CLASSES] tracking only IDs:", ", ".join(human))
         except Exception:
             pass
 
-        # Try CUDA/Half if available (best effort; safe to fail)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                model.to("cuda")
-                try:
-                    model.model.half()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Open camera
-        if sys.platform.startswith("win"):
-            cap = cv2.VideoCapture(YOLO_CAM_INDEX, cv2.CAP_DSHOW)
-        else:
-            cap = cv2.VideoCapture(YOLO_CAM_INDEX)
-        if not cap.isOpened():
+        # Camera open with fallback (item 12)
+        cam_indices = [YOLO_CAM_INDEX, 0, 1, 2]
+        cap = None
+        for idx in cam_indices:
+            tmp = self._open_camera(idx)
+            if tmp.isOpened():
+                cap = tmp
+                # update global for profile save
+                globals()["YOLO_CAM_INDEX"] = idx
+                print(f"[CAM] opened index {idx}")
+                break
+        if cap is None:
             print("No camera found"); self.yolo_status.set("YOLO: no camera"); self.yolo_enabled=False; return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         fps = float(fps) if fps and fps > 0 else 30.0
 
-        # DeepSORT init
+        # DeepSORT init on CPU only
         try:
-            tracker = DeepSort(
-                max_age=DS_MAX_AGE,
-                n_init=DS_N_INIT,
-                max_iou_distance=DS_MAX_IOU,
-                nn_budget=DS_NN_BUDGET,
-                nms_max_overlap=1.0,
-                embedder=DS_EMBEDDER,
-                half=DS_HALF
-            )
+            tracker = _make_deepsort_cpu()
+            print("[DeepSORT] using CPU embedder")
         except Exception as e:
             print("DeepSORT init failed:", e)
             self.yolo_status.set("DeepSORT: init failed")
             self.yolo_enabled = False
+            try:
+                cap.release()
+            except Exception:
+                pass
             return
 
         self._trk_id = None
@@ -1235,7 +1571,7 @@ class FakeSticks:
             src = None
 
             try:
-                # Downscale for inference on RPi (map boxes back)
+                # Downscale for inference (map back)
                 if DET_DOWNSCALE and 0.2 <= DET_DOWNSCALE < 1.0:
                     dw, dh = int(w * DET_DOWNSCALE), int(h * DET_DOWNSCALE)
                     infer_frame = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_AREA)
@@ -1262,7 +1598,6 @@ class FakeSticks:
                         if TARGET_CLASS_IDS is not None and cls not in TARGET_CLASS_IDS:
                             continue
                         x1, y1, x2, y2 = map(float, b.xyxy[0])
-                        # map back to original frame size
                         x1, x2 = x1 * scale_x, x2 * scale_x
                         y1, y2 = y1 * scale_y, y2 * scale_y
                         conf = float(b.conf[0].item()) if hasattr(b, "conf") else 0.0
@@ -1357,7 +1692,6 @@ class FakeSticks:
                     if abs(self._dx_lp) <= YAW_DB_PIX:
                         rc4_to_send = RC_MID
                     else:
-                        # gain schedule: stronger far from center, softer near center
                         err_norm = min(1.0, abs(self._dx_lp) / (w * 0.5))
                         kp_eff = kp * (0.85 + 0.30 * err_norm)
                         kd_eff = kd * (0.85 + 0.30 * err_norm)
@@ -1367,8 +1701,8 @@ class FakeSticks:
                         yaw_cmd = clamp(kp_eff * e_norm + kd_eff * d_norm, -1.0, 1.0)
                         rc4_to_send = int(RC_MID + yaw_cmd * YAW_MAX_RC_DELTA)
 
-                    # ensure minimal throttle for tracking if not in hold
-                    if (not self._is_hold_context()) and self.thr.get() < YOLO_THR_MIN:
+                    # item 11: auto throttle minimum while tracking (only if not in hold)
+                    if self.auto_thr_min.get() and (not self._is_hold_context()) and self.thr.get() < YOLO_THR_MIN:
                         self._set_thr(YOLO_THR_MIN)
 
                 # Pitch forward with soft-stop near NEAR
@@ -1382,7 +1716,6 @@ class FakeSticks:
 
                 if self.vs_pitch_en.get():
                     if sel_bbox is not None and (area_frac is not None) and abs(self._dx_lp) <= yaw_ok and (far_sz <= area_frac <= near_sz):
-                        # soft-stop factor as area approaches NEAR
                         if near_sz > VS_TGT_AREA_FRAC:
                             soft = clamp((near_sz - area_frac) / (near_sz - VS_TGT_AREA_FRAC), 0.0, 1.0)
                         else:
@@ -1418,6 +1751,10 @@ class FakeSticks:
                     self._vs_pitch_rc = int(self._vs_pitch_rc + 0.2*(RC_MID - self._vs_pitch_rc))
                     self.pitch.set(self._vs_pitch_rc)
 
+                # Publish bbox (item 14)
+                if sel_bbox is not None:
+                    self._publish_bbox(sel_bbox, None, area_frac, target_dx, src)
+
                 # Preview
                 if YOLO_SHOW_WINDOW:
                     cv2.imshow("YOLO + DeepSORT (Yaw PD + Forward)", annotated)
@@ -1430,6 +1767,13 @@ class FakeSticks:
 
             except Exception as e:
                 print("[YOLO+DS] inference/tracking error:", e)
+
+            # limiter when no window (item 8)
+            if not YOLO_SHOW_WINDOW:
+                dt = time.time() - t0
+                min_dt = 1.0 / MAX_FPS_NO_WINDOW
+                if dt < min_dt:
+                    time.sleep(min_dt - dt)
 
             if YOLO_SHOW_WINDOW:
                 k = cv2.waitKey(1) & 0xFF
@@ -1522,6 +1866,34 @@ class FakeSticks:
         self._enable_guided_keepalive(lat, lon, new_tgt)
         print(f"[GUIDED] Target altitude -> {new_tgt:.2f} m (relative, keepalive). RC3 capped at {THR_SAFE_MAX} while hold active.")
 
+    def go_to_gps(self, lat_deg: float, lon_deg: float, alt_rel_m: float):
+        try:
+            self.set_mode("GUIDED")
+            for _ in range(5):
+                self._send_guided_position(float(lat_deg), float(lon_deg), float(alt_rel_m))
+                time.sleep(0.05)
+            self._enable_guided_keepalive(float(lat_deg), float(lon_deg), float(alt_rel_m))
+            self.alt_tgt.set(round(float(alt_rel_m), 2))
+            print(f"[GUIDED] Go-to -> lat={lat_deg:.7f}, lon={lon_deg:.7f}, alt_rel={alt_rel_m:.2f} m (keepalive on)")
+        except Exception as e:
+            messagebox.showerror("GUIDED", f"Go-to failed: {e}")
+
+    def prompt_go_to(self):
+        try:
+            lat = simpledialog.askfloat("Go To", "Latitude (deg):", parent=self.root)
+            if lat is None:
+                return
+            lon = simpledialog.askfloat("Go To", "Longitude (deg):", parent=self.root)
+            if lon is None:
+                return
+            default_alt = float(self._alt_val) if (self._alt_val is not None) else 10.0
+            alt = simpledialog.askfloat("Go To", "Altitude AGL (m):", initialvalue=round(default_alt, 2), parent=self.root)
+            if alt is None:
+                return
+            self.go_to_gps(float(lat), float(lon), float(alt))
+        except Exception as e:
+            messagebox.showerror("GUIDED", f"Input error: {e}")
+
     # ---------- Emergency Stop (async) ----------
     def emergency_stop_async(self):
         if self._e_stop_active:
@@ -1582,11 +1954,26 @@ class FakeSticks:
             print(f"[E-STOP] Done. Sticks held for {E_STOP_HOLD_S:.1f}s. You can ARM now (X).")
 
     # ---------- ARM/DISARM/Reset/Close ----------
+    SAFE_ARM_MODES = {"GUIDED", "STABILIZE", "ALT_HOLD"}  # item 10
+
     def force_arm(self):
         self._clear_flight_termination()
         if self._e_stop_active or time.time() < self._arm_inhibit_until:
-            print("[FORCE ARM] Inhibited (E-STOP/cooldown).")
-            return
+            print("[FORCE ARM] inhibited"); return
+        try:
+            cur_mode = None
+            mm = self.m.mode_mapping()
+            hb = self.m.recv_match(type="HEARTBEAT", blocking=False)
+            if hb:
+                for name, code in mm.items():
+                    if code == hb.custom_mode:
+                        cur_mode = name
+                        break
+            if cur_mode and cur_mode not in self.SAFE_ARM_MODES:
+                print(f"[FORCE ARM] unsafe mode: {cur_mode}")
+                return
+        except Exception:
+            pass
         self.m.mav.command_long_send(
             self.m.target_system, self.m.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 21196, 0,0,0,0,0
@@ -1605,6 +1992,13 @@ class FakeSticks:
         self.servo5.set(1500); self.servo7.set(1500)
 
     def on_close(self):
+        # item 15: safety confirm if ARMED
+        try:
+            if self.is_armed:
+                if not messagebox.askyesno("Exit", "Vehicle is ARMED. Disarm and exit?"):
+                    return
+        except Exception:
+            pass
         if messagebox.askokcancel("Exit", "Close GUI?"):
             self.running = False
             try: self.stop_yolo()
@@ -1619,16 +2013,38 @@ class FakeSticks:
             except Exception as e:
                 print("[MAVLink] close error:", e)
             time.sleep(0.1)
+            # stop external tracker if running
+            try:
+                if hasattr(self, "_track_proc") and self._track_proc and (self._track_proc.poll() is None):
+                    self._track_proc.terminate()
+            except Exception:
+                pass
+            self._track_proc = None
             self.root.destroy()
 
+    # ---------- Live classes (item 13) ----------
+    def _apply_classes_live(self):
+        text = self.cls_entry.get().strip()
+        arr = [t.strip() for t in text.split(",")] if text else None
+        global TARGET_CLASSES, TARGET_CLASS_IDS
+        TARGET_CLASSES = arr
+        TARGET_CLASS_IDS = None
+        print("[CLASSES] will re-resolve on next model run:", TARGET_CLASSES)
 
 # ================= main =================
 def main():
-    # Parse CLI and apply overrides
     global YOLO_MODEL_NAME, DET_DOWNSCALE, YOLO_CONF, YOLO_IOU
     global YOLO_CAM_INDEX, YOLO_SHOW_WINDOW, TARGET_CLASSES
 
     args = _parse_args()
+
+    # item 16: apply presets
+    if args.preset == "rpi-lite":
+        args.conf = 0.35; args.iou = 0.45; args.det_downscale = 0.5; args.no_window = True
+    elif args.preset == "laptop-cpu":
+        args.conf = 0.25; args.iou = 0.50; args.det_downscale = 0.67
+    elif args.preset == "cam-hires":
+        args.conf = 0.20; args.iou = 0.50; args.det_downscale = 1.0
 
     YOLO_MODEL_NAME  = args.yolo_model
     DET_DOWNSCALE    = args.det_downscale
@@ -1640,8 +2056,7 @@ def main():
     TARGET_CLASSES = _normalize_classnames_arg(args.classnames)
 
     if args.tracker == "bytetrack":
-        print("[WARN] --tracker bytetrack requested, but this build runs DeepSORT backend. "
-              "Proceeding with DeepSORT. Ask for a ByteTrack-enabled build if needed.")
+        print("[WARN] --tracker bytetrack requested, but this build runs DeepSORT backend. Proceeding with DeepSORT.")
 
     if not YOLO_OK or not DS_OK or cv2 is None:
         print("ERROR: Missing dependencies. Required: OpenCV, ultralytics, deep-sort-realtime.")
@@ -1651,7 +2066,6 @@ def main():
     root = tk.Tk()
     FakeSticks(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

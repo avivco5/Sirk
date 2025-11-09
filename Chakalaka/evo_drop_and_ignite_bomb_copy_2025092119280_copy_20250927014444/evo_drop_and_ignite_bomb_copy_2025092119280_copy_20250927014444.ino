@@ -20,6 +20,8 @@ const float VREF_VOLTS = 3.3; // אם משתמשים ב-AREF חיצוני 3.3V
 // analogReference(EXTERNAL);
 
 /* ========= NeoPixel ========= */
+
+
 #define NUM_LEDS 3
 #define LED_TYPE WS2812
 #define COLOR_ORDER GRB
@@ -145,8 +147,8 @@ void setup(){
 
   // === כיול חיישן אור ===
   int baseline = readLightAvg();
-  ADC_DARK  = baseline + 200;      
-  ADC_LIGHT = ADC_DARK + 550;      
+  ADC_DARK  = baseline ;      
+  ADC_LIGHT = ADC_DARK +300;      
 #if DEBUG
   Serial.print(F("Light calibration: baseline=")); Serial.print(baseline);
   Serial.print(F("  ADC_DARK=")); Serial.print(ADC_DARK);

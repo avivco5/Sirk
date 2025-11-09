@@ -23,11 +23,14 @@ Notes:
 """
 
 import sys, glob
+from serial.tools import list_ports
 import math, time, threading, queue, re, os
 import argparse
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter import font as tkfont
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Numpy must be imported before some trackers; also patch legacy aliases
 import numpy as np
@@ -78,8 +81,19 @@ if sys.platform.startswith("linux"):
     DEVICE = cands[0] if cands else "/dev/ttyACM0"
     BAUD = 115200
 else:
-    DEVICE = "COM20"
+    # === Auto-detect MAVLink port on Windows ===
+    DEVICE = None
+    for p in list_ports.comports():
+        name = (p.description or "").lower()
+        if "mavlink" in name:
+            DEVICE = p.device
+            print(f"[AUTO] Found MAVLink device: {p.device} ({p.description})")
+            break
+    if DEVICE is None:
+        print("[WARN] No MAVLink port found, defaulting to COM4")
+        DEVICE = "COM4"
     BAUD = 115200
+
 
 # ---------------- Joystick Mapping ----------------
 # Linux (RPi) PS4 axis mapping:
