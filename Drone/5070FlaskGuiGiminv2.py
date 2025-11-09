@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ASCII-only comments.
-
 Dash map for drone telemetry + MAVLink helpers:
 - Reads MAVLink from serial FC on COM4 (default) and updates the map live
 - (Optional) Also listens to UDP JSON on port 9002 and merges fields if present
@@ -14,8 +12,9 @@ Dash map for drone telemetry + MAVLink helpers:
 - Adds MAVLink: auto-connect, GUIDED hold-here, Go-To (lat/lon/alt), +/-1m bumps, keepalive thread
 - Overlay toolbars stay above the map (z-index) without blocking map gestures.
 
-Dependencies:
-  pip install dash dash-leaflet pymavlink
+Tracking Control Additions:
+- Buttons to start/stop an external tracking script (e.g., hybrid_tracker.py).
+- NOTE: Icon/DivIcon components removed due to dash-leaflet version incompatibility.
 """
 
 import os
@@ -25,8 +24,10 @@ import math
 import socket
 import threading
 from datetime import datetime
+import subprocess  # חדש: להפעלת תהליכים חיצוניים
 
-from dash import Dash, html, dcc, callback, Output, Input, State, no_update, ctx
+# ייבוא מעודכן ל-clientside_callback
+from dash import Dash, html, dcc, callback, Output, Input, State, no_update, ctx, clientside_callback
 import dash_leaflet as dl
 from flask import Flask
 
@@ -53,9 +54,9 @@ latest = {
     "lon": None,
     "roll": 0.0,
     "pitch": 0.0,
-    "yaw": 0.0,           # degrees
+    "yaw": 0.0,  # degrees
     "groundspeed": 0.0,
-    "alt": 0.0,           # relative if GLOBAL_POSITION_INT.relative_alt; fallback AMSL via VFR_HUD
+    "alt": 0.0,  # relative if GLOBAL_POSITION_INT.relative_alt; fallback AMSL via VFR_HUD
     "voltage": None,
     "device_status": {"gps": False, "mpu": False, "obd": False},
     "gps_quality": None,
@@ -69,14 +70,55 @@ lock = threading.Lock()
 PREFER_MAVLINK = True
 
 # Go-To line state
-goto_target = None          # (lat, lon, alt_rel)
+goto_target = None  # (lat, lon, alt_rel)
 goto_lock = threading.Lock()
+
+# ----- Tracking Control (External Process) -----
+TRACKING_PROCESS = None
+# הפקודה להפעלת סקריפט המעקב החיצוני. שנה לפי הצורך אם שם הקובץ שונה.
+TRACKING_CMD = "python hybrid_tracker.py --no-window"
+
+
+def start_tracking_process():
+    global TRACKING_PROCESS
+    if TRACKING_PROCESS is None:
+        print(f"[TRACKER] Starting external tracker: {TRACKING_CMD}")
+        try:
+            TRACKING_PROCESS = subprocess.Popen(TRACKING_CMD, shell=True)
+            print(f"[TRACKER] Process PID: {TRACKING_PROCESS.pid}")
+            return True
+        except Exception as e:
+            print(f"[TRACKER] Failed to start process: {e}")
+            TRACKING_PROCESS = None
+            return False
+    print("[TRACKER] Process already running.")
+    return True
+
+
+def stop_tracking_process():
+    global TRACKING_PROCESS
+    if TRACKING_PROCESS is not None:
+        print("[TRACKER] Stopping external tracker...")
+        try:
+            TRACKING_PROCESS.terminate()
+            TRACKING_PROCESS.wait(timeout=3)
+            if TRACKING_PROCESS.poll() is None:
+                print("[TRACKER] Termination failed, attempting kill.")
+                TRACKING_PROCESS.kill()
+        except Exception as e:
+            print(f"[TRACKER] Error terminating/killing process: {e}")
+        TRACKING_PROCESS = None
+        print("[TRACKER] Process stopped.")
+        return True
+    print("[TRACKER] No process running.")
+    return False
+
 
 # ----- Small geo helpers -----
 EARTH_R_M = 6371000.0
 
+
 def haversine_m(lat1, lon1, lat2, lon2):
-    # Returns distance in meters
     if None in (lat1, lon1, lat2, lon2):
         return None
     rlat1 = math.radians(lat1)
@@ -85,28 +127,30 @@ def haversine_m(lat1, lon1, lat2, lon2):
     rlon2 = math.radians(lon2)
     dlat = rlat2 - rlat1
     dlon = rlon2 - rlon1
-    a = math.sin(dlat/2.0)**2 + math.cos(rlat1)*math.cos(rlat2)*math.sin(dlon/2.0)**2
+    a = math.sin(dlat / 2.0) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2.0) ** 2
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return EARTH_R_M * c
 
+
 def project_forward(lat, lon, bearing_deg, dist_m):
-    # Returns new (lat, lon) given start, bearing (deg, 0=north, positive clockwise), and distance meters
     if None in (lat, lon) or dist_m is None:
         return None, None
     br = math.radians(bearing_deg)
     rlat = math.radians(lat)
     rlon = math.radians(lon)
     dr = dist_m / EARTH_R_M
-    nlat = math.asin(math.sin(rlat)*math.cos(dr) + math.cos(rlat)*math.sin(dr)*math.cos(br))
-    nlon = rlon + math.atan2(math.sin(br)*math.sin(dr)*math.cos(rlat),
-                             math.cos(dr) - math.sin(rlat)*math.sin(nlat))
+    nlat = math.asin(math.sin(rlat) * math.cos(dr) + math.cos(rlat) * math.sin(dr) * math.cos(br))
+    nlon = rlon + math.atan2(math.sin(br) * math.sin(dr) * math.cos(rlat),
+                             math.cos(dr) - math.sin(rlat) * math.sin(nlat))
     return math.degrees(nlat), math.degrees(nlon)
+
 
 def clamp01(x):
     try:
         return max(0.0, min(1.0, float(x)))
     except Exception:
         return 0.0
+
 
 def dist_color_hex(dist_m, max_m=500.0):
     # Red when far, green when close. Map 0..max_m to green..red
@@ -119,13 +163,16 @@ def dist_color_hex(dist_m, max_m=500.0):
     b = 0
     return f"#{r:02x}{g:02x}{b:02x}"
 
+
 def append_csv(ts_iso, lat, lon):
     # append a line to the CSV log
     with open(GPS_LOG_FILENAME, "a", newline="") as f:
         csv.writer(f).writerow([ts_iso, lat, lon])
 
+
 # ----- UDP listener -----
 UDP_PORT = 9002
+
 
 def _valid_num(x):
     try:
@@ -133,6 +180,7 @@ def _valid_num(x):
         return math.isfinite(xf)
     except Exception:
         return False
+
 
 def udp_listener():
     # UDP listener for external telemetry JSON
@@ -150,17 +198,17 @@ def udp_listener():
 
         with lock:
             for k in (
-                "lat",
-                "lon",
-                "roll",
-                "pitch",
-                "yaw",
-                "groundspeed",
-                "alt",
-                "voltage",
-                "gps_quality",
-                "gps_sats",
-                "gps_hdop",
+                    "lat",
+                    "lon",
+                    "roll",
+                    "pitch",
+                    "yaw",
+                    "groundspeed",
+                    "alt",
+                    "voltage",
+                    "gps_quality",
+                    "gps_sats",
+                    "gps_hdop",
             ):
                 if k in data and data[k] is not None:
                     # Do not overwrite MAVLink with UDP if PREFER_MAVLINK is True and MAVLink already filled it
@@ -178,14 +226,15 @@ def udp_listener():
             lat = latest["lat"]
             lon = latest["lon"]
             if (
-                isinstance(lat, (int, float))
-                and isinstance(lon, (int, float))
-                and lat != 0.0
-                and lon != 0.0
+                    isinstance(lat, (int, float))
+                    and isinstance(lon, (int, float))
+                    and lat != 0.0
+                    and lon != 0.0
             ):
                 if not track or (abs(lat - track[-1][0]) > 1e-9 or abs(lon - track[-1][1]) > 1e-9):
                     track.append((lat, lon))
                     append_csv(datetime.now().isoformat(), lat, lon)
+
 
 # ----- MAVLink (control) -----
 # You can override by env:
@@ -205,9 +254,11 @@ _guided_active = False
 _guided_target = None  # (lat, lon, alt_rel)
 _guided_lock = threading.Lock()
 
+
 def _time_boot_ms():
     import time
     return int((time.time() % 1e6) * 1000)
+
 
 def mav_connect():
     global mav, armed_state, flight_mode
@@ -220,17 +271,17 @@ def mav_connect():
         # Request message intervals (best-effort)
         try:
             req = [
-                (mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,             10),
-                (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,  10),
-                (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD,               5),
-                (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,            1),
-                (mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT,           1),
+                (mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10),
+                (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 10),
+                (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 5),
+                (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1),
+                (mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, 1),
             ]
             for mid, hz in req:
                 m.mav.command_long_send(
                     m.target_system, m.target_component,
                     mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                    0, mid, int(1e6/float(hz)), 0,0,0,0,0
+                    0, mid, int(1e6 / float(hz)), 0, 0, 0, 0, 0
                 )
         except Exception:
             pass
@@ -275,16 +326,16 @@ def mav_connect():
                         lat = msg.lat / 1e7
                         lon = msg.lon / 1e7
                         alt_rel = msg.relative_alt / 1000.0  # mm -> m
-                        vx, vy = msg.vx/100.0, msg.vy/100.0  # cm/s -> m/s
-                        gs = max(0.0, (vx*vx + vy*vy) ** 0.5)
+                        vx, vy = msg.vx / 100.0, msg.vy / 100.0  # cm/s -> m/s
+                        gs = max(0.0, (vx * vx + vy * vy) ** 0.5)
                         latest["lat"] = lat
                         latest["lon"] = lon
                         latest["alt"] = alt_rel
                         latest["groundspeed"] = gs
                         latest["device_status"]["gps"] = True
                         if (
-                            isinstance(lat, float) and isinstance(lon, float)
-                            and (last_pos is None or abs(lat-last_pos[0])>1e-9 or abs(lon-last_pos[1])>1e-9)
+                                isinstance(lat, float) and isinstance(lon, float)
+                                and (last_pos is None or abs(lat - last_pos[0]) > 1e-9 or abs(lon - last_pos[1]) > 1e-9)
                         ):
                             track.append((lat, lon))
                             append_csv(datetime.now().isoformat(), lat, lon)
@@ -302,9 +353,9 @@ def mav_connect():
 
                 elif t == "ATTITUDE":
                     try:
-                        latest["roll"]  = math.degrees(float(msg.roll))
+                        latest["roll"] = math.degrees(float(msg.roll))
                         latest["pitch"] = math.degrees(float(msg.pitch))
-                        latest["yaw"]   = math.degrees(float(msg.yaw))
+                        latest["yaw"] = math.degrees(float(msg.yaw))
                     except Exception:
                         pass
 
@@ -341,6 +392,7 @@ def mav_connect():
 
     threading.Thread(target=_rx_loop, daemon=True).start()
 
+
 def set_mode(mode_name):
     with mav_lock:
         m = mav
@@ -356,6 +408,7 @@ def set_mode(mode_name):
         print(f"[MAV] set_mode {mode_name} failed:", e)
         return False
 
+
 def _send_guided_position(lat, lon, alt_rel_m):
     with mav_lock:
         m = mav
@@ -363,14 +416,14 @@ def _send_guided_position(lat, lon, alt_rel_m):
         return
     try:
         type_mask = (
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE |
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
         )
         m.mav.set_position_target_global_int_send(
             _time_boot_ms(),
@@ -378,10 +431,11 @@ def _send_guided_position(lat, lon, alt_rel_m):
             mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
             type_mask,
             int(lat * 1e7), int(lon * 1e7), float(alt_rel_m),
-            0,0,0, 0,0,0, 0.0, 0.0
+            0, 0, 0, 0, 0, 0, 0.0, 0.0
         )
     except Exception as e:
         print("[MAV] set_position_target_global_int error:", e)
+
 
 def _enable_guided_keepalive(lat, lon, alt_rel_m):
     global _guided_active, _guided_target
@@ -389,12 +443,14 @@ def _enable_guided_keepalive(lat, lon, alt_rel_m):
         _guided_target = (float(lat), float(lon), float(alt_rel_m))
         _guided_active = True
 
+
 def stop_guided_hold():
     global _guided_active, _guided_target
     with _guided_lock:
         _guided_active = False
         _guided_target = None
     print("[GUIDED] keepalive stopped")
+
 
 def guided_keepalive_loop():
     import time
@@ -407,6 +463,7 @@ def guided_keepalive_loop():
         if tgt:
             _send_guided_position(*tgt)
         time.sleep(period)
+
 
 def hold_here_current_alt():
     with lock:
@@ -427,10 +484,13 @@ def hold_here_current_alt():
     print(f"[GUIDED] Holding here at alt_rel={alt:.2f} m (keepalive).")
     return True
 
+
 def go_to_gps(lat, lon, alt_rel_m):
     # Remember target for UI line/marker even if FC rejects for now
     try:
-        lat = float(lat); lon = float(lon); alt_rel_m = float(alt_rel_m)
+        lat = float(lat);
+        lon = float(lon);
+        alt_rel_m = float(alt_rel_m)
     except Exception:
         print("[MAV] Go-To bad inputs")
         return False
@@ -442,14 +502,17 @@ def go_to_gps(lat, lon, alt_rel_m):
     if ok:
         import time
         for _ in range(5):
-            _send_guided_position(lat, lon, alt_rel_m); time.sleep(0.05)
+            _send_guided_position(lat, lon, alt_rel_m);
+            time.sleep(0.05)
         t0 = time.time()
         while time.time() - t0 < 2.0:
-            _send_guided_position(lat, lon, alt_rel_m); time.sleep(0.2)
+            _send_guided_position(lat, lon, alt_rel_m);
+            time.sleep(0.2)
         _enable_guided_keepalive(lat, lon, alt_rel_m)
 
     print(f"[GUIDED] Go-To lat={lat:.7f} lon={lon:.7f} alt_rel={alt_rel_m:.2f}")
     return True
+
 
 def bump_alt_guided(delta_m):
     tgt = None
@@ -470,6 +533,7 @@ def bump_alt_guided(delta_m):
     print(f"[GUIDED] Target alt -> {new_alt:.2f} m")
     return True
 
+
 # ----- Web app (Dash) -----
 server = Flask(__name__)
 app = Dash(
@@ -486,6 +550,7 @@ layer_urls = {
     "osm": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "google": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
 }
+
 
 def telemetry_chip(label, value_id, units, color):
     # small metric card
@@ -518,11 +583,13 @@ def telemetry_chip(label, value_id, units, color):
         },
     )
 
+
 def gps_text_chip():
     # small card that shows "lat, lon" as a single line of text
     return html.Div(
         [
-            html.Div("GPS", style={"fontWeight": "bold", "fontSize": "0.95em", "color": "#38b6ff", "marginBottom": "4px"}),
+            html.Div("GPS",
+                     style={"fontWeight": "bold", "fontSize": "0.95em", "color": "#38b6ff", "marginBottom": "4px"}),
             html.Div(id="val-gps", style={"fontSize": "1.1em", "fontWeight": "bold", "color": "#fff"}),
         ],
         style={
@@ -536,6 +603,7 @@ def gps_text_chip():
             "boxShadow": "0 0 16px 0 #38b6ff33",
         },
     )
+
 
 def status_chip():
     # container for status rows
@@ -553,6 +621,7 @@ def status_chip():
         },
     )
 
+
 def mav_status_chip():
     # free-text chip for MAV/UDP status
     return html.Div(
@@ -569,6 +638,7 @@ def mav_status_chip():
         children="Waiting for telemetry...",
     )
 
+
 def mav_chip():
     # small container for MAVLink status and controls
     return html.Div(
@@ -577,10 +647,14 @@ def mav_chip():
             html.Div(
                 [
                     dcc.Input(id="goto-lat", type="number", placeholder="lat", style={"width": "120px"}),
-                    dcc.Input(id="goto-lon", type="number", placeholder="lon", style={"width": "120px", "marginLeft": "6px"}),
-                    dcc.Input(id="goto-alt", type="number", placeholder="alt m", style={"width": "90px", "marginLeft": "6px"}),
-                    html.Button("Go To", id="btn-goto", n_clicks=0, style={"marginLeft": "8px", "pointerEvents": "auto"}),
-                    html.Button("Hold here", id="btn-hold", n_clicks=0, style={"marginLeft": "6px", "pointerEvents": "auto"}),
+                    dcc.Input(id="goto-lon", type="number", placeholder="lon",
+                              style={"width": "120px", "marginLeft": "6px"}),
+                    dcc.Input(id="goto-alt", type="number", placeholder="alt m",
+                              style={"width": "90px", "marginLeft": "6px"}),
+                    html.Button("Go To", id="btn-goto", n_clicks=0,
+                                style={"marginLeft": "8px", "pointerEvents": "auto"}),
+                    html.Button("Hold here", id="btn-hold", n_clicks=0,
+                                style={"marginLeft": "6px", "pointerEvents": "auto"}),
                     html.Button("+1m", id="btn-up1", n_clicks=0, style={"marginLeft": "6px", "pointerEvents": "auto"}),
                     html.Button("-1m", id="btn-dn1", n_clicks=0, style={"marginLeft": "6px", "pointerEvents": "auto"}),
                 ],
@@ -595,6 +669,7 @@ def mav_chip():
             "boxShadow": "0 0 16px 0 #00e1ff33",
         },
     )
+
 
 # ---- Layout with overlays above the map ----
 app.layout = html.Div(
@@ -614,7 +689,8 @@ app.layout = html.Div(
                     ],
                     value="esri",
                     inputStyle={"marginRight": "6px"},
-                    labelStyle={"display": "inline-flex", "alignItems": "center", "marginRight": "14px", "color": "#fff"},
+                    labelStyle={"display": "inline-flex", "alignItems": "center", "marginRight": "14px",
+                                "color": "#fff"},
                     style={
                         "display": "flex",
                         "flexWrap": "nowrap",
@@ -634,6 +710,19 @@ app.layout = html.Div(
                     style={"marginLeft": "12px", "pointerEvents": "auto"},
                 ),
                 html.Div(mav_chip(), style={"marginLeft": "12px"}),
+
+                # --- כפתורי מעקב ---
+                html.Div(
+                    [
+                        html.Button("Start Tracking", id="btn-start-tracking", n_clicks=0,
+                                    style={"pointerEvents": "auto", "backgroundColor": "#28a745", "color": "white"}),
+                        html.Button("Stop Tracking", id="btn-stop-tracking", n_clicks=0,
+                                    style={"pointerEvents": "auto", "backgroundColor": "#dc3545", "color": "white",
+                                           "marginLeft": "6px"}),
+                    ],
+                    style={"marginLeft": "12px", "display": "flex", "alignItems": "center", "pointerEvents": "none"},
+                ),
+                # -------------------------
             ],
             style={
                 "position": "fixed",
@@ -677,6 +766,8 @@ app.layout = html.Div(
 
         # Hidden store for manual center
         dcc.Store(id="manual-center", data=None),
+        # Store for Yaw value
+        dcc.Store(id="yaw-store", data=0.0),
 
         # Map container
         html.Div(
@@ -690,7 +781,13 @@ app.layout = html.Div(
                         dl.Polyline(id="track", positions=[], color="blue", weight=6, opacity=0.85),
                         dl.Polyline(id="goto-line", positions=[], color="red", weight=4, opacity=0.95),
                         dl.Polyline(id="heading-line", positions=[], color="white", weight=3, opacity=0.9),
-                        dl.Marker(id="veh", position=[32.08, 34.77]),
+                        # MARKER FIX: חזרנו למארקר בסיסי (ברירת מחדל של Leaflet)
+                        # כדי למנוע את השגיאות DivIcon/Icon
+                        dl.Marker(
+                            id="veh",
+                            position=[32.08, 34.77],
+                            children=[dl.Tooltip("Drone")],
+                        ),
                         dl.Marker(
                             id="target-marker",
                             position=[32.08, 34.77],
@@ -710,6 +807,7 @@ app.layout = html.Div(
     style={"margin": 0, "padding": 0, "background": "#111"},
 )
 
+
 # ---- Helpers to format ----
 def _fmt(v, prec=2):
     try:
@@ -719,10 +817,12 @@ def _fmt(v, prec=2):
     except Exception:
         return "-"
 
+
 # ---- Callbacks ----
 @callback(Output("tile", "url"), Input("layer", "value"))
 def change_layer(layer):
     return layer_urls.get(layer, layer_urls["esri"])
+
 
 @callback(
     Output("map", "center"),
@@ -735,6 +835,7 @@ def change_layer(layer):
     Output("target-marker", "opacity"),
     Output("heading-line", "positions"),
     Output("manual-center", "data"),
+    Output("yaw-store", "data"),  # שמירת ערך Yaw
     Input("tick", "n_intervals"),
     Input("center-btn", "n_clicks"),
     Input("fit-btn", "n_clicks"),
@@ -803,14 +904,17 @@ def update_map(_n, c_clicks, f_clicks, follow_val, manual_center):
         manual_center = center
 
     veh_pos = [pos[0], pos[1]] if have_pos else no_update
+    current_yaw = yaw_deg if isinstance(yaw_deg, (int, float)) else 0.0  # ערך Yaw ל-Store
 
     return (
         center, zoom, trk, veh_pos,
         goto_positions, goto_color,
         target_pos, target_opacity,
         heading_positions,
-        manual_center
+        manual_center,
+        current_yaw  # החזרת Yaw ל-Store
     )
+
 
 @callback(
     Output("val-speed", "children"),
@@ -857,7 +961,8 @@ def update_cards(_n):
     gps_color = "#24e07a" if gps_has_fix else ("#ff9900" if st.get("gps") else "#ff4444")
     gps_prefix = "[OK]" if gps_has_fix else ("[WARN]" if st.get("gps") else "[X]")
     gps_row = html.Div(
-        [html.Span(gps_prefix + " "), f"GPS  sats={sats if sats is not None else '-'}  hdop={hdop if hdop is not None else '-'}"],
+        [html.Span(gps_prefix + " "),
+         f"GPS  sats={sats if sats is not None else '-'}  hdop={hdop if hdop is not None else '-'}"],
         style={"color": gps_color, "fontWeight": "bold"},
     )
     children = [gps_row, row(st.get("mpu", False), "MPU")]
@@ -865,17 +970,24 @@ def update_cards(_n):
     with mav_lock:
         m = mav
     if m:
-        mav_line = f"MAV OK | Mode={flight_mode} | Armed={'YES' if armed_state else 'NO'} | Port={MAVLINK_DEVICE}"
+        mav_line = f"MAV OK | Mode={flight_mode} | Armed={armed_state}"
     else:
-        mav_line = f"MAV DISCONNECTED | Port={MAVLINK_DEVICE}"
+        mav_line = "MAV DISCONNECTED"
 
-    return s, alt, gps_text, vb, r, p, y, children, mav_line, mav_line
+    top_status = f"Mode: {flight_mode} | Armed: {'Yes' if armed_state else 'No'}"
+
+    return s, alt, gps_text, vb, r, p, y, children, mav_line, top_status
+
+
+# --- Clientside callback for marker rotation (JavaScript) ---
+# נמחק כי המארקר הבסיסי לא תומך בסיבוב
+# ---------------------------------------------
+
 
 @callback(
-    Output("btn-goto", "n_clicks"),
-    Output("btn-hold", "n_clicks"),
-    Output("btn-up1", "n_clicks"),
-    Output("btn-dn1", "n_clicks"),
+    Output("goto-lat", "value"),
+    Output("goto-lon", "value"),
+    Output("goto-alt", "value"),
     Input("btn-goto", "n_clicks"),
     Input("btn-hold", "n_clicks"),
     Input("btn-up1", "n_clicks"),
@@ -883,55 +995,67 @@ def update_cards(_n):
     State("goto-lat", "value"),
     State("goto-lon", "value"),
     State("goto-alt", "value"),
-    prevent_initial_call=True,
 )
-def mav_controls(n_goto, n_hold, n_up, n_dn, v_lat, v_lon, v_alt):
-    which = ctx.triggered_id
-    if which == "btn-goto":
-        if v_lat is None or v_lon is None or v_alt is None:
-            print("[MAV] Go-To missing lat/lon/alt.")
-        else:
-            go_to_gps(v_lat, v_lon, v_alt)
-    elif which == "btn-hold":
+def handle_mav_controls(goto_n, hold_n, up1_n, dn1_n, lat_v, lon_v, alt_v):
+    trig_id = ctx.triggered_id
+    if trig_id is None or trig_id == "goto-lat":
+        return no_update, no_update, no_update
+
+    if trig_id == "btn-goto":
+        if lat_v and lon_v and alt_v:
+            go_to_gps(lat_v, lon_v, alt_v)
+    elif trig_id == "btn-hold":
         hold_here_current_alt()
-    elif which == "btn-up1":
-        bump_alt_guided(+1.0)
-    elif which == "btn-dn1":
+    elif trig_id == "btn-up1":
+        bump_alt_guided(1.0)
+    elif trig_id == "btn-dn1":
         bump_alt_guided(-1.0)
 
-    # Reset click counters to avoid repeated triggers
-    return 0, 0, 0, 0
+    # Always return no_update for the inputs themselves to keep user values
+    return no_update, no_update, no_update
 
-# ---- Utilities ----
-def _get_lan_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "0.0.0.0"
 
-def main():
-    # Start UDP listener
-    threading.Thread(target=udp_listener, daemon=True).start()
+# --- Callback לשליטה על המעקב החיצוני ---
+@callback(
+    Output("btn-start-tracking", "children"),
+    Output("btn-stop-tracking", "children"),
+    Input("btn-start-tracking", "n_clicks"),
+    Input("btn-stop-tracking", "n_clicks"),
+    prevent_initial_call=True
+)
+def handle_tracking_control(start_n, stop_n):
+    trig_id = ctx.triggered_id
 
-    # Start MAVLink and keepalive
-    threading.Thread(target=mav_connect, daemon=True).start()
-    threading.Thread(target=guided_keepalive_loop, daemon=True).start()
+    if trig_id == "btn-start-tracking":
+        if start_tracking_process():
+            return "Start Tracking (Active)", "Stop Tracking"
+        return "Start Tracking (Failed)", "Stop Tracking"
 
-    # Server printout similar to Flask dev server style
-    host = "0.0.0.0"
-    port = 8050
-    lan = _get_lan_ip()
+    elif trig_id == "btn-stop-tracking":
+        if stop_tracking_process():
+            return "Start Tracking", "Stop Tracking (Stopped)"
+        return "Start Tracking", "Stop Tracking"
 
-    print(f"* Running on all addresses ({host})")
-    print(f"* Running on http://127.0.0.1:{port}")
-    print(f"* Running on http://{lan}:{port}")
-    print("[MAP] Dash listening (press CTRL+C to quit)")
+    return no_update, no_update
 
-    app.run(host=host, port=port, debug=False)
+
+# ------------------------------------------------
+
 
 if __name__ == "__main__":
-    main()
+    # Start MAVLink connection thread
+    threading.Thread(target=mav_connect, daemon=True).start()
+    # Start Guided Keepalive thread
+    threading.Thread(target=guided_keepalive_loop, daemon=True).start()
+    # Start optional UDP listener thread
+    threading.Thread(target=udp_listener, daemon=True).start()
+
+    print("-" * 50)
+    print(f"MAVLink Device: {MAVLINK_DEVICE} @ {MAVLINK_BAUD}")
+    print(f"UDP Telemetry Port: {UDP_PORT}")
+    print(f"GPS Log File: {GPS_LOG_FILENAME}")
+    print(f"Tracking Command: {TRACKING_CMD}")
+    print("-" * 50)
+
+    # Dash app runs the Flask server
+    app.run(debug=True, host='0.0.0.0', port=5070)

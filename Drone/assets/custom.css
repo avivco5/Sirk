@@ -1,0 +1,5 @@
+.drone-marker-icon {
+    /* מבטל אנימציות ברירת מחדל ושומר על האייקון ממוקם במרכז */
+    transition: none !important;
+    transform-origin: center center;
+}

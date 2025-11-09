@@ -3,7 +3,7 @@
 """
 ASCII-only, english comments
 
-Hybrid GUI Tracker (merged 2-16):
+Hybrid GUI Trackerv2 (merged 2-16):
 - YOLOv8 detection
 - DeepSORT (Kalman + ReID) for robust identity memory and motion prediction
 - PD yaw controller with gain scheduling + deadband + low-pass on dx
