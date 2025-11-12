@@ -1,50 +1,49 @@
 # gui_mav_to_sim_pose.py
-# GUI for position control in a simulator (Isaac) + real attitude from MAVLink.
-# Adds ARM / FORCE-ARM / DISARM buttons to actually arm the real motors.
-# Sends UDP JSON to the sim:
+# GUI לשליטת מיקום בסימולציה (Isaac) + שמירה על Roll/Pitch/Yaw מהרחפן האמיתי (MAVLink).
+# שולח UDP JSON:
 #   {"cmd":"setpose","x":..,"y":..,"alt":..,"roll_deg":..,"pitch_deg":..,"yaw_deg":..}
-#   {"cmd":"spin","rpm":..}   # visual rotors in sim (not real ESC control)
+#   {"cmd":"spin","rpm":..}  # ← חדש: שליטת RPM לפרופים (ויזואלי בסימולציה)
+# כדי לעבוד, תריץ ב-Isaac את הסקריפט המאזין (isaac_listener_pose_pid.py/… שמטפל גם ב-"spin") על UDP 6000.
 
 import math, time, json, socket, threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# ==== Configuration ====
+# ==== תצורה ====
 MAV_PORT = "COM14"
 MAV_BAUD = 115200
 
 SIM_IP, SIM_PORT = "127.0.0.1", 6000
-SEND_RATE_HZ = 20.0
+SEND_RATE_HZ = 20.0                 # קצב שליחה לסימולציה
 
-# Visual prop spin in simulator only (not real):
-SPIN_DEFAULT_RPM   = 10000.0
-SPIN_MAX_RPM       = 20000.0
-SPIN_HEARTBEAT_HZ  = 2.0
+# ---- שליטה על סיבוב פרופים (ויזואלי בסימולציה) ----
+SPIN_DEFAULT_RPM   = 10000.0        # RPM בעת הפעלה
+SPIN_MAX_RPM       = 20000.0        # טווח הסליידר
+SPIN_HEARTBEAT_HZ  = 2.0            # כל כמה זמן לשלוח אישור מצב כש-ON
 
-# GUI steps
-POS_STEP = 0.5
-ALT_STEP = 0.3
-
-# YOLO mapping (optional)
+# צעדים/רגישות GUI
+POS_STEP = 0.5                      # מטר לכל לחיצה קדימה/ימינה/אחורה/שמאלה (במערכת הגוף)
+ALT_STEP = 0.3                      # מטר לכל לחיצה Alt+/Alt-
+# מיפוי YOLO (אם מדליקים)
 ENABLE_YOLO = True
-K_FWD_M_PER_PX   = 0.000
-K_SIDE_M_PER_PX  = 0.002
-K_ALT_M_PER_PX   = 0.000
-TARGET_BOX_H_PX  = 220
-DB_PIX           = 40
-NUDGE_CLAMP_M    = 0.7
-# =======================
+K_FWD_M_PER_PX   = 0.000           # פיקסלים → תזוזת "קדימה" (X בגוף)
+K_SIDE_M_PER_PX  = 0.002           # פיקסלים → תזוזת "ימינה/שמאלה" (Y בגוף)
+K_ALT_M_PER_PX   = 0.000           # פיקסלים → שינוי גובה
+TARGET_BOX_H_PX  = 220              # גובה יעד של הבוקס (שולט על מרחק)
+DB_PIX           = 40               # deadband סביב מרכז הפריים
+NUDGE_CLAMP_M    = 0.7              # הגבלת דחיפה פר פריים
+# =================
 
 # ---- MAVLink ----
 from pymavlink import mavutil
 
-# ---- Optional YOLO ----
+# ---- YOLO אופציונלי ----
 if ENABLE_YOLO:
     try:
         import cv2
         from ultralytics import YOLO
     except Exception as e:
-        print("YOLO/Camera not loaded, disabling YOLO:", e)
+        print("⚠️ YOLO/Camera לא נטענו, מכבה YOLO:", e)
         ENABLE_YOLO = False
 
 # ---- UDP → Isaac ----
@@ -63,6 +62,7 @@ def send_setpose(x, y, alt, roll_deg, pitch_deg, yaw_deg):
     except Exception as e:
         print("[UDP] send error:", e)
 
+# חדש: פקודת RPM לפרופים
 def send_spin(rpm):
     msg = {"cmd":"spin","rpm": float(rpm)}
     try:
@@ -70,104 +70,39 @@ def send_spin(rpm):
     except Exception as e:
         print("[UDP] spin send error:", e)
 
-# ---- Shared state ----
+# ---- מצב משותף ----
 state_lock = threading.Lock()
 
-# Real attitude (radians) from MAVLink
+# טלמטריית ג׳יירו מהרחפן (רדיאנים)
 roll_rad = 0.0
 pitch_rad = 0.0
 yaw_rad = 0.0
 
-# Position setpoint (world) controlled by GUI/YOLO
+# סט-פוינט מיקום (עולם) שנשלט ע"י GUI/YOLO
 cur_x = 0.0
 cur_y = 0.0
 cur_alt = 2.0
 
-# Visual rotor state (sim only)
+# מצב רוטורים (לסימולציה)
 rotors_on = False
 spin_rpm_cmd = SPIN_DEFAULT_RPM
 
-# Flags
+# דגלים
 quit_flag = False
 tracking_enabled = False
 
-# ---- MAVLink connection and helpers ----
+# ---- חיבור MAVLink ----
 master = None
-
 def connect_mav():
     global master
     print(f"[MAV] connecting {MAV_PORT} @ {MAV_BAUD} ...")
     master = mavutil.mavlink_connection(MAV_PORT, baud=MAV_BAUD)
     master.wait_heartbeat()
-    print("[MAV] connected: sys", master.target_system, "comp", master.target_component)
-
-def is_armed():
-    try:
-        return master.motors_armed()
-    except Exception:
-        return False
-
-def set_mode(mode_name="STABILIZE", timeout=5.0):
-    try:
-        mapping = master.mode_mapping()
-        if not mapping or mode_name not in mapping:
-            print("[MODE] mapping unavailable or mode not found:", mode_name)
-            return False
-        target_id = mapping[mode_name]
-        master.mav.set_mode_send(
-            master.target_system,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            target_id,
-        )
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            hb = master.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
-            if hb and hasattr(hb, "custom_mode") and hb.custom_mode == target_id:
-                print("[MODE] set:", mode_name)
-                return True
-        print("[MODE] timeout waiting for", mode_name)
-        return False
-    except Exception as e:
-        print("[MODE] error:", e)
-        return False
-
-def arm(force=False, timeout=8.0):
-    """
-    Arms motors using MAV_CMD_COMPONENT_ARM_DISARM.
-    force=True will try to bypass arming checks (bench only, props removed).
-    """
-    p2 = 21196 if force else 0
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, p2, 0, 0, 0, 0, 0
-    )
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        if is_armed():
-            print("[ARM] ARMED")
-            return True
-        time.sleep(0.2)
-    print("[ARM] failed (check PreArm checks: SD logging, GPS, sensors)")
-    return False
-
-def disarm(timeout=6.0):
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 0, 0, 0, 0, 0, 0, 0
-    )
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        if not is_armed():
-            print("[ARM] DISARMED")
-            return True
-        time.sleep(0.2)
-    print("[ARM] disarm timeout")
-    return False
+    print("✅ MAVLink connected:", "sys", master.target_system, "comp", master.target_component)
 
 def mav_telemetry_loop():
     global roll_rad, pitch_rad, yaw_rad
+    last_print = 0.0
     while not quit_flag:
         try:
             msg = master.recv_match(blocking=False, timeout=0.1)
@@ -182,13 +117,14 @@ def mav_telemetry_loop():
                 roll_rad  = float(msg.roll)
                 pitch_rad = float(msg.pitch)
                 yaw_rad   = float(msg.yaw)
-        elif t == "STATUSTEXT":
-            # Helpful to see prearm reasons, etc.
-            sev = getattr(msg, "severity", None)
-            txt = getattr(msg, "text", "")
-            print(f"[STATUSTEXT{' '+str(sev) if sev is not None else ''}] {txt}")
+        now = time.time()
+        if now - last_print > 1.0:
+            with state_lock:
+                r, p, y = math.degrees(roll_rad), math.degrees(pitch_rad), math.degrees(yaw_rad)
+            print(f"[MAV] R/P/Y = ({r:+5.1f},{p:+5.1f},{y:+5.1f})°")
+            last_print = now
 
-# ---- periodic TX to simulator ----
+# ---- שולח תקופתי לסימולציה ----
 def tx_loop():
     period = 1.0 / SEND_RATE_HZ
     while not quit_flag:
@@ -201,6 +137,7 @@ def tx_loop():
         if dt < period:
             time.sleep(period - dt)
 
+# חדש: Heartbeat לשליחת RPM קבוע כשמצב ON
 def spin_tx_loop():
     period = 1.0 / SPIN_HEARTBEAT_HZ
     while not quit_flag:
@@ -216,23 +153,23 @@ root = tk.Tk()
 root.title("Drone GUI → Isaac (Position by GUI/YOLO, Attitude by MAVLink)")
 
 status = tk.StringVar(value="Disconnected")
-ttk.Label(root, textvariable=status, anchor="w").grid(row=0, column=0, columnspan=8, sticky="ew", padx=8, pady=(8,4))
+ttk.Label(root, textvariable=status, anchor="w").grid(row=0, column=0, columnspan=6, sticky="ew", padx=8, pady=(8,4))
 
-vals = tk.StringVar(value="x=0.00 y=0.00 alt=2.00 | RPY=0/0/0 | RPM=OFF | ARMED=NO")
-ttk.Label(root, textvariable=vals, anchor="w").grid(row=1, column=0, columnspan=8, sticky="ew", padx=8)
+# תצוגת ערכים
+vals = tk.StringVar(value="x=0.00 y=0.00 alt=2.00 | RPY=0/0/0 | RPM=OFF")
+ttk.Label(root, textvariable=vals, anchor="w").grid(row=1, column=0, columnspan=6, sticky="ew", padx=8)
 
 def update_label():
-    armed = is_armed() if master else False
     with state_lock:
         rpm_text = f"ON {int(spin_rpm_cmd)}" if rotors_on else "OFF"
         s = (f"x={cur_x:.2f} y={cur_y:.2f} alt={cur_alt:.2f} | "
              f"RPY={math.degrees(roll_rad):.1f}/{math.degrees(pitch_rad):.1f}/{math.degrees(yaw_rad):.1f}° | "
-             f"RPM={rpm_text} | ARMED={'YES' if armed else 'NO'}")
+             f"RPM={rpm_text}")
     vals.set(s)
     if not quit_flag:
         root.after(150, update_label)
 
-# Alt slider
+# סליידר גובה
 def on_alt(val):
     global cur_alt
     with state_lock:
@@ -240,10 +177,10 @@ def on_alt(val):
 
 alt_slider = ttk.Scale(root, from_=6.0, to=0.0, orient="vertical", command=on_alt, length=240)
 alt_slider.set(cur_alt)
-alt_slider.grid(row=2, column=0, rowspan=7, padx=8, pady=8, sticky="ns")
-ttk.Label(root, text="Altitude [m]").grid(row=9, column=0)
+alt_slider.grid(row=2, column=0, rowspan=6, padx=8, pady=8, sticky="ns")
+ttk.Label(root, text="גובה [m]").grid(row=8, column=0)
 
-# Body-frame nudges
+# פונקציית דחיפה במערכת הגוף: dx (קדימה+), dy (ימינה+)
 def nudge_body(dx_b, dy_b):
     global cur_x, cur_y
     with state_lock:
@@ -268,14 +205,14 @@ def do_alt(dir):
         cur_alt = max(0.0, cur_alt)
     alt_slider.set(cur_alt)
 
-# Visual RPM controls (sim only)
+# --- שליטת RPM ב-GUI ---
 def on_rpm_change(val):
     global spin_rpm_cmd
     with state_lock:
         spin_rpm_cmd = float(val)
         on = rotors_on
     if on:
-        send_spin(spin_rpm_cmd)
+        send_spin(spin_rpm_cmd)  # עדכון מיידי
 
 def spin_on():
     global rotors_on
@@ -283,58 +220,35 @@ def spin_on():
         rotors_on = True
         rpm = spin_rpm_cmd
     send_spin(rpm)
-    print("[SPIN] ON ->", int(rpm), "RPM (sim only)")
+    print(f"[SPIN] ON → {rpm:.0f} RPM")
 
 def spin_off():
     global rotors_on
     with state_lock:
         rotors_on = False
     send_spin(0.0)
-    print("[SPIN] OFF (sim only)")
+    print("[SPIN] OFF")
 
-# Movement buttons
-ttk.Button(root, text="Forward", command=lambda: move("forward")).grid(row=2, column=2, columnspan=2, sticky="ew", pady=4)
-ttk.Button(root, text="Left",    command=lambda: move("left")).grid(row=3, column=2, sticky="ew", padx=4, pady=4)
-ttk.Button(root, text="Right",   command=lambda: move("right")).grid(row=3, column=3, sticky="ew", padx=4, pady=4)
-ttk.Button(root, text="Back",    command=lambda: move("back")).grid(row=4, column=2, columnspan=2, sticky="ew", pady=4)
+# כפתורים
+ttk.Button(root, text="⬆️ קדימה", command=lambda: move("forward")).grid(row=2, column=2, columnspan=2, sticky="ew", pady=4)
+ttk.Button(root, text="⬅️ שמאלה", command=lambda: move("left")).grid(row=3, column=2, sticky="ew", padx=4, pady=4)
+ttk.Button(root, text="➡️ ימינה",  command=lambda: move("right")).grid(row=3, column=3, sticky="ew", padx=4, pady=4)
+ttk.Button(root, text="⬇️ אחורה", command=lambda: move("back")).grid(row=4, column=2, columnspan=2, sticky="ew", pady=4)
 
-ttk.Button(root, text="Alt+", command=lambda: do_alt("up")).grid(row=5, column=2, sticky="ew", padx=4, pady=4)
-ttk.Button(root, text="Alt-", command=lambda: do_alt("down")).grid(row=5, column=3, sticky="ew", padx=4, pady=4)
+ttk.Button(root, text="⬆️ Alt+", command=lambda: do_alt("up")).grid(row=5, column=2, sticky="ew", padx=4, pady=4)
+ttk.Button(root, text="⬇️ Alt-", command=lambda: do_alt("down")).grid(row=5, column=3, sticky="ew", padx=4, pady=4)
 
-# Sim rotor + RPM slider
-ttk.Button(root, text="Rotors ON (sim)",  command=spin_on ).grid(row=6, column=4, sticky="ew", padx=4, pady=(8,4))
-ttk.Button(root, text="Rotors OFF (sim)", command=spin_off).grid(row=6, column=5, sticky="ew", padx=4, pady=(8,4))
-ttk.Label(root, text="RPM (sim)").grid(row=7, column=4, sticky="w", padx=4)
+# כפתורי רוטורים + סליידר RPM
+ttk.Button(root, text="🌀 Rotors ON",  command=spin_on ).grid(row=6, column=4, sticky="ew", padx=4, pady=(8,4))
+ttk.Button(root, text="⏹ Rotors OFF", command=spin_off).grid(row=6, column=5, sticky="ew", padx=4, pady=(8,4))
+
+ttk.Label(root, text="RPM").grid(row=7, column=4, sticky="w", padx=4)
 rpm_slider = ttk.Scale(root, from_=0.0, to=SPIN_MAX_RPM, orient="horizontal",
                        command=on_rpm_change, length=220)
 rpm_slider.set(SPIN_DEFAULT_RPM)
 rpm_slider.grid(row=7, column=5, sticky="ew", padx=4, pady=(4,8))
 
-# === ARM / DISARM controls (real) ===
-def do_set_mode():
-    ok = set_mode("STABILIZE")
-    status.set("Mode STABILIZE set" if ok else "Mode set failed")
-
-def do_arm():
-    # Normal arming (requires all prearm checks to pass)
-    ok = arm(force=False)
-    status.set("ARMED" if ok else "Arm failed (see STATUSTEXT)")
-
-def do_force_arm():
-    # Force-arming: bench only, props removed. Bypasses checks like SD/GPS.
-    ok = arm(force=True)
-    status.set("FORCE-ARMED" if ok else "Force-arm failed (see STATUSTEXT)")
-
-def do_disarm():
-    ok = disarm()
-    status.set("DISARMED" if ok else "Disarm failed")
-
-ttk.Button(root, text="Set Mode: STABILIZE", command=do_set_mode).grid(row=2, column=4, sticky="ew", padx=4, pady=4)
-ttk.Button(root, text="ARM",                 command=do_arm).grid(row=3, column=4, sticky="ew", padx=4, pady=4)
-ttk.Button(root, text="Force-ARM (bench)",   command=do_force_arm).grid(row=3, column=5, sticky="ew", padx=4, pady=4)
-ttk.Button(root, text="DISARM",              command=do_disarm).grid(row=4, column=4, sticky="ew", padx=4, pady=4)
-
-# Keyboard shortcuts
+# קיצורי מקלדת
 def on_key(e):
     k = e.keysym.lower()
     if   k == "w": move("forward")
@@ -343,36 +257,36 @@ def on_key(e):
     elif k == "d": move("right")
     elif k == "e": do_alt("up")
     elif k == "q": do_alt("down")
-    elif k == "r": do_arm()
-    elif k == "f": do_disarm()
+    elif k == "r": spin_on()
+    elif k == "f": spin_off()
 root.bind("<Key>", on_key)
 
-# YOLO start/stop
+# ---- YOLO (מוסיף רק דחיפות מיקום; לא משנה R/P/Y) ----
 def start_tracking():
     global tracking_enabled
     tracking_enabled = True
-    print("YOLO tracking ON")
+    print("✅ YOLO tracking ON")
 
 def stop_tracking():
     global tracking_enabled
     tracking_enabled = False
-    print("YOLO tracking OFF")
+    print("⛔ YOLO tracking OFF")
 
-ttk.Button(root, text="Start Tracking", command=start_tracking).grid(row=6, column=2, sticky="ew", padx=4, pady=(8,4))
-ttk.Button(root, text="Stop Tracking",  command=stop_tracking).grid(row=6, column=3, sticky="ew", padx=4, pady=(8,4))
+ttk.Button(root, text="▶️ Start Tracking", command=start_tracking).grid(row=6, column=2, sticky="ew", padx=4, pady=(8,4))
+ttk.Button(root, text="⏹ Stop Tracking",  command=stop_tracking).grid(row=6, column=3, sticky="ew", padx=4, pady=(8,4))
 
 def yolo_loop():
     if not ENABLE_YOLO:
         return
     try:
-        model = YOLO("yolov8n.pt")
+        model = YOLO("../yolov8n.pt")
     except Exception as e:
-        print("YOLO load failed:", e); return
+        print("⚠️ YOLO load failed:", e); return
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("No camera found"); return
+        print("⚠️ No camera found"); return
 
-    print("[YOLO] ready. Press ESC to close window.")
+    print("[YOLO] ready. ESC to close preview window.")
     while not quit_flag:
         ok, frame = cap.read()
         if not ok: break
@@ -397,15 +311,18 @@ def yolo_loop():
                 dy_px = cy - (h*0.5)
                 dh_px = TARGET_BOX_H_PX - box_h
 
+                # תרגום לפקודות BODY: קדימה, צד, גובה
                 dx_b = K_FWD_M_PER_PX  * dh_px
                 dy_b = K_SIDE_M_PER_PX * (dx_px if abs(dx_px) > DB_PIX else 0.0)
                 dalt = K_ALT_M_PER_PX  * (-dy_px if abs(dy_px) > DB_PIX else 0.0)
 
+                # הגבלות
                 dx_b = max(-NUDGE_CLAMP_M, min(NUDGE_CLAMP_M, dx_b))
                 dy_b = max(-NUDGE_CLAMP_M, min(NUDGE_CLAMP_M, dy_b))
                 dalt = max(-NUDGE_CLAMP_M, min(NUDGE_CLAMP_M, dalt))
 
                 if abs(dx_b) > 1e-3 or abs(dy_b) > 1e-3 or abs(dalt) > 1e-3:
+                    # עדכון מטרות GUI (ה-TX ישלח בעצמו)
                     nudge_body(dx_b, dy_b)
                     with state_lock:
                         global cur_alt
@@ -413,6 +330,7 @@ def yolo_loop():
                     alt_slider.set(cur_alt)
                     print(f"[YOLO→GUI] dB=({dx_b:+.2f},{dy_b:+.2f}) dAlt={dalt:+.2f}")
 
+                # ציור
                 annotated = frame.copy()
                 cv2.rectangle(annotated, (int(x1),int(y1)), (int(x2),int(y2)), (0,255,0), 2)
                 cv2.circle(annotated, (int(cx),int(cy)), 5, (0,0,255), -1)
@@ -431,35 +349,29 @@ def yolo_loop():
     except: pass
     print("[YOLO] stopped")
 
-# ---- clean shutdown ----
+# ---- סגירה נקייה ----
 def on_close():
     global quit_flag
-    try:
-        # Try to disarm on exit for safety
-        if master:
-            disarm()
-    except Exception:
-        pass
     if messagebox.askokcancel("Exit", "Close GUI and stop sending to sim?"):
         quit_flag = True
         root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", on_close)
 
-# ---- main ----
+# ---- הפעלה ----
 def main():
-    # MAVLink
+    # חיבור MAVLink
     try:
         connect_mav()
         status.set("Connected to MAVLink")
     except Exception as e:
         status.set("MAVLink connection failed")
-        print("MAVLink connect failed:", e)
+        print("❌ MAVLink connect failed:", e)
 
-    # Threads
+    # תהליכים
     threading.Thread(target=mav_telemetry_loop, daemon=True).start()
     threading.Thread(target=tx_loop,           daemon=True).start()
-    threading.Thread(target=spin_tx_loop,      daemon=True).start()
+    threading.Thread(target=spin_tx_loop,      daemon=True).start()   # ← חדש: heartbeat ל-RPM
     if ENABLE_YOLO:
         threading.Thread(target=yolo_loop,     daemon=True).start()
 

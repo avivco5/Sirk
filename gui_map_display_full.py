@@ -1,315 +1,277 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ASCII-only, english comments
+
+Dash GUI for map and control:
+- Receives MAVLink bytes on UDP 14550 and parses basic telemetry.
+- Receives YOLO bbox on UDP 9103 (optional).
+- Sends JSON commands over UDP 9104 to the tracker/proxy.
+- Includes Takeoff, Set Home, Disable Fence, Mode, Arm/Disarm, Go-To, Hold, Alt bump.
+"""
+
 import sys
-import os
-import csv
-import json
 import math
+import json
+import time
 import socket
 import threading
 from datetime import datetime
-import time
 
 from dash import Dash, html, dcc, callback, Output, Input, State, no_update, ctx
 import dash_leaflet as dl
 from flask import Flask
-
-# ייבוא MAVLink לניתוח הודעות (לא לשליטה ישירה)
 from pymavlink import mavutil
 
 try:
     from pymavlink.dialects.v20 import ardupilotmega as mavlink
-except ImportError:
+except Exception:
     from pymavlink.dialects.v20 import common as mavlink
 
-# --- Global Telemetry State ---
-global_mav_data = {
-    'lat': 31.92722038182233, 'lon':  34.79135576510038, 'alt': 50.0, 'heading': 0, 'roll': 0, 'pitch': 0,
-    'vfr_hud_gs': 0.0, 'sat_fix': 0, 'flight_mode': 'UNKNOWN', 'volt': 0.0, 'current': 0.0,
-    'target_lat': None, 'target_lon': None, 'target_alt': None,
-    'bbox': None
-}
+# ---------------- Communication ----------------
+UDP_IP = "127.0.0.1"
+UDP_PORT_TEL  = 14550  # tracker -> GUI (MAVLink raw bytes)
+UDP_PORT_BBOX = 9103   # tracker -> GUI (bbox json)
+UDP_PORT_CMD  = 9104   # GUI -> tracker (commands json)
 
-# --- Communication Settings ---
-UDP_IP = '127.0.0.1'
-UDP_PORT_TEL = 14550  # קבלת טלמטריה מהטרקר
-UDP_PORT_BBOX = 9103  # קבלת BBox מהטרקר
-UDP_PORT_CMD = 9104  # שליחת פקודות לטרקר
-
-# --- Styles ---
-STYLES = {
-    'main_container': {'display': 'flex', 'flexDirection': 'column', 'height': '100vh', 'margin': '0'},
-    'header': {'padding': '12px', 'backgroundColor': '#333', 'color': 'white', 'textAlign': 'center',
-               'fontSize': '24px', 'fontWeight': 'bold', 'zIndex': '1001'},
-    'map_container': {'flexGrow': '1', 'position': 'relative'},
-    'telemetry_strip': {'padding': '10px', 'backgroundColor': '#1E90FF', 'color': 'white',
-                        'textAlign': 'center', 'fontSize': '16px', 'fontWeight': 'bold'},
-    'overlay_controls': {
-        'position': 'absolute', 'top': '10px', 'left': '10px', 'zIndex': '1000',
-        'backgroundColor': 'rgba(255, 255, 255, 0.95)', 'padding': '15px', 'borderRadius': '8px',
-        'boxShadow': '0 4px 12px rgba(0,0,0,0.3)', 'maxWidth': '300px'
-    }
-}
-
-# --- UDP Command Sender ---
 UDP_CMD_SOCK = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-
 def send_command_to_tracker(cmd_type, data=None):
-    """שולח פקודת JSON לטרקר דרך UDP 9104."""
-    if data is None: data = {}
-    message = json.dumps({"command": cmd_type, "data": data})
-    try:
-        UDP_CMD_SOCK.sendto(message.encode('utf-8'), (UDP_IP, UDP_PORT_CMD))
-        print(f"[CMD] Sent: {cmd_type} with data: {data}")
-        return True
-    except Exception as e:
-        print(f"[CMD] Failed to send {cmd_type}: {e}")
-        return False
+    """Send a JSON command to the tracker on UDP 9104."""
+    if data is None:
+        data = {}
+    msg = json.dumps({"command": cmd_type, "data": data})
+    UDP_CMD_SOCK.sendto(msg.encode("utf-8"), (UDP_IP, UDP_PORT_CMD))
+    return f"[{datetime.now().strftime('%H:%M:%S')}] CMD {cmd_type} {data}"
 
+# ---------------- Global telemetry state ----------------
+global_mav_data = {
+    "lat": 31.9272203818, "lon": 34.7913557651, "alt": 0.0,
+    "heading": 0.0, "roll": 0.0, "pitch": 0.0,
+    "vfr_hud_gs": 0.0, "flight_mode": "UNKNOWN",
+    "volt": 0.0, "current": 0.0,
+    "target_lat": None, "target_lon": None, "target_alt": None,
+    "bbox": None
+}
 
-# ================= UDP Listener Threads =================
-
+# ---------------- UDP listeners ----------------
 def udp_listener_tel():
-    # ... (כפי שהיה)
-    # קבלת טלמטריה מ-MAVLink והעברתה ל-global_mav_data
+    """Listen for MAVLink bytes and update global state."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((UDP_IP, UDP_PORT_TEL))
-        print(f"[UDP-TEL] Listening for Telemetry on {UDP_IP}:{UDP_PORT_TEL}")
-        mav_parser = mavlink.MAVLink(file=None, srcSystem=1, srcComponent=1)
+        print(f"[UDP-TEL] Listening on {UDP_IP}:{UDP_PORT_TEL}")
+        parser = mavlink.MAVLink(file=None, srcSystem=1, srcComponent=1)
         while True:
-            raw_bytes, addr = sock.recvfrom(2048)
-            msgs = mav_parser.parse_buffer(raw_bytes)
-            if msgs:
-                for msg in msgs:
-                    msg_type = msg.get_type()
-
-                    if msg_type == 'VFR_HUD':
-                        global_mav_data['alt'] = msg.alt
-                        global_mav_data['vfr_hud_gs'] = msg.groundspeed
-                    elif msg_type == 'GLOBAL_POSITION_INT':
-                        global_mav_data['lat'] = msg.lat / 1e7
-                        global_mav_data['lon'] = msg.lon / 1e7
-                        global_mav_data['heading'] = msg.hdg / 100
-                    elif msg_type == 'ATTITUDE':
-                        global_mav_data['roll'] = math.degrees(msg.roll)
-                        global_mav_data['pitch'] = math.degrees(msg.pitch)
-                    elif msg_type == 'SYS_STATUS':
-                        global_mav_data['volt'] = msg.voltage_battery / 1000.0
-                        global_mav_data['current'] = msg.current_battery / 100.0
-                    elif msg_type == 'HEARTBEAT':
-                        global_mav_data['flight_mode'] = mavutil.mode_string_v10(msg)
-
+            raw, _ = sock.recvfrom(2048)
+            msgs = parser.parse_buffer(raw)
+            if not msgs:
+                continue
+            for msg in msgs:
+                t = msg.get_type()
+                if t == "VFR_HUD":
+                    global_mav_data["alt"] = float(msg.alt)
+                    global_mav_data["vfr_hud_gs"] = float(msg.groundspeed)
+                elif t == "GLOBAL_POSITION_INT":
+                    global_mav_data["lat"] = msg.lat / 1e7
+                    global_mav_data["lon"] = msg.lon / 1e7
+                    global_mav_data["heading"] = msg.hdg / 100.0
+                elif t == "ATTITUDE":
+                    global_mav_data["roll"] = math.degrees(msg.roll)
+                    global_mav_data["pitch"] = math.degrees(msg.pitch)
+                elif t == "SYS_STATUS":
+                    global_mav_data["volt"] = msg.voltage_battery / 1000.0
+                    global_mav_data["current"] = msg.current_battery / 100.0
+                elif t == "HEARTBEAT":
+                    global_mav_data["flight_mode"] = mavutil.mode_string_v10(msg)
     except Exception as e:
-        print(f"[UDP-TEL] Error in listener: {e}")
-
+        print(f"[UDP-TEL] Error: {e}")
 
 def udp_listener_bbox():
-    # ... (כפי שהיה)
-    # קבלת נתוני BBox - מטפל ב-null כשאובייקט אובד
+    """Listen for bbox JSON messages and update state."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((UDP_IP, UDP_PORT_BBOX))
-        print(f"[UDP-BBOX] Listening for BBox on {UDP_IP}:{UDP_PORT_BBOX}")
+        print(f"[UDP-BBOX] Listening on {UDP_IP}:{UDP_PORT_BBOX}")
         while True:
-            data, addr = sock.recvfrom(1024)
-            message = data.decode('utf-8')
-            bbox_obj = json.loads(message)
-            if 'bbox' in bbox_obj:
-                global_mav_data['bbox'] = bbox_obj['bbox']
+            data, _ = sock.recvfrom(1024)
+            try:
+                obj = json.loads(data.decode("utf-8"))
+                global_mav_data["bbox"] = obj.get("bbox", None)
+            except Exception:
+                pass
     except Exception as e:
-        print(f"[UDP-BBOX] Error in listener: {e}")
+        print(f"[UDP-BBOX] Error: {e}")
 
-
-# ================= UI Helpers =================
-
+# ---------------- Helpers ----------------
 def calculate_bearing(lat1, lon1, lat2, lon2):
-    # ... (כפי שהיה)
-    """מחשב זווית (Bearing) מנקודה 1 לנקודה 2 במעלות."""
-    lat1_rad = math.radians(lat1)
-    lon1_rad = math.radians(lon1)
-    lat2_rad = math.radians(lat2)
-    lon2_rad = math.radians(lon2)
+    """Return initial bearing from point 1 to point 2 in degrees."""
+    lat1_rad = math.radians(lat1); lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2); lon2_rad = math.radians(lon2)
+    dlon = lon2_rad - lon1_rad
+    y = math.sin(dlon) * math.cos(lat2_rad)
+    x = math.cos(lat1_rad)*math.sin(lat2_rad) - math.sin(lat1_rad)*math.cos(lat2_rad)*math.cos(dlon)
+    brg = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+    return brg
 
-    dLon = lon2_rad - lon1_rad
+# ---------------- Styles ----------------
+STYLES = {
+    "main_container": {"display": "flex", "flexDirection": "column", "height": "100vh", "margin": "0"},
+    "header": {"padding": "12px", "backgroundColor": "#333", "color": "white",
+               "textAlign": "center", "fontSize": "24px", "fontWeight": "bold"},
+    "map_container": {"flexGrow": "1", "position": "relative"},
+    "panel": {"position": "absolute", "top": "10px", "left": "10px", "zIndex": "1000",
+              "backgroundColor": "rgba(255,255,255,0.95)", "padding": "14px",
+              "borderRadius": "8px", "boxShadow": "0 4px 12px rgba(0,0,0,0.3)", "maxWidth": "340px"},
+    "strip": {"padding": "10px", "backgroundColor": "#1E90FF", "color": "white",
+              "textAlign": "center", "fontSize": "16px", "fontWeight": "bold"},
+    "section_title": {"marginTop": "10px", "fontSize": "16px", "borderBottom": "1px solid #ccc", "paddingBottom": "5px"},
+}
 
-    y = math.sin(dLon) * math.cos(lat2_rad)
-    x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dLon)
-
-    bearing = math.degrees(math.atan2(y, x))
-    return (bearing + 360) % 360
-
-
-# ================= Dash Layout (מעודכן) =================
-
+# ---------------- App ----------------
 server = Flask(__name__)
 app = Dash(__name__, server=server)
 
-app.layout = html.Div(style=STYLES['main_container'], children=[
-
+app.layout = html.Div(style=STYLES["main_container"], children=[
     dcc.Interval(id="interval-1s", interval=1000, n_intervals=0),
     dcc.Interval(id="interval-300ms", interval=300, n_intervals=0),
 
-    html.Div(style=STYLES['header'], children="ממשק מפה ושליטה (COM4 -> UDP)"),
+    html.Div("Map and Control GUI", style=STYLES["header"]),
 
-    html.Div(style=STYLES['map_container'], children=[
-
-        # 2a. המפה
+    html.Div(style=STYLES["map_container"], children=[
         dl.Map(
             id="map",
-            center=[global_mav_data['lat'], global_mav_data['lon']],
+            center=[global_mav_data["lat"], global_mav_data["lon"]],
             zoom=16,
             children=[
                 dl.TileLayer(url="https://{s}.tile.osm.org/{z}/{x}/{y}.png"),
-
-                # מארקר הרחפן
-                dl.Marker(id="drone-marker", position=[global_mav_data['lat'], global_mav_data['lon']], children=[
-                    dl.Tooltip(id="drone-tooltip")
-                ]),
-                # קו כיוון הרחפן
-                dl.Polyline(id="heading-line", positions=[[0, 0], [0, 0]], color="orange", weight=3),
-
-                # קו Go-To (יעד)
+                dl.Marker(id="drone-marker",
+                          position=[global_mav_data["lat"], global_mav_data["lon"]],
+                          children=[dl.Tooltip(id="drone-tooltip")]),
+                dl.Polyline(id="heading-line", positions=[[0, 0], [0, 0]], weight=3),
                 dl.Polyline(id="goto-line", positions=[[0, 0], [0, 0]], color="red", weight=4),
             ],
-            style={'width': '100%', 'height': '100%'}
+            style={"width": "100%", "height": "100%"}
         ),
 
-        # 2b. פאנל שליטה צף
-        html.Div(style=STYLES['overlay_controls'], children=[
-            html.H4("שליטה ויעדים (UDP)",
-                    style={'marginTop': '0', 'borderBottom': '1px solid #ccc', 'paddingBottom': '5px'}),
+        html.Div(style=STYLES["panel"], children=[
+            html.H4("Control", style={"marginTop": "0", "borderBottom": "1px solid #ccc", "paddingBottom": "5px"}),
 
-            # --- הזנת יעד (Go-To) ---
+            # Go-To
             html.Div([
-                html.B("יעד GPS:"),
-                dcc.Input(
-                    id="input-gps-full",
-                    type="text",
-                    placeholder="Latitude, Longitude",
-                    style={'width': '100%', 'marginBottom': '5px'},
-                    value="32.09, 34.81"
-                ),
-                dcc.Input(id="input-alt", type="text", placeholder="Alt (m) [ריק = גובה נוכחי]",
-                          style={'width': '45%', 'marginRight': '5px'}),
+                html.B("Go-To GPS:"),
+                dcc.Input(id="input-gps-full", type="text", placeholder="lat, lon",
+                          style={"width": "100%", "marginBottom": "6px"}, value="32.09, 34.81"),
+                dcc.Input(id="input-alt", type="text", placeholder="Alt (m) [empty=current]",
+                          style={"width": "45%", "marginRight": "5px"}),
                 html.Button("Go-To", id="btn-goto", n_clicks=0,
-                            style={'width': '45%', 'backgroundColor': '#28a745', 'color': 'white'}),
-            ], style={'marginBottom': '10px'}),
+                            style={"width": "45%", "backgroundColor": "#28a745", "color": "white"}),
+            ], style={"marginBottom": "10px"}),
 
-            # --- כפתורי שליטה (Alt/Hold) ---
+            # Hold + Alt bumps
             html.Div([
                 html.Button("Hold Here", id="btn-hold", n_clicks=0,
-                            style={'width': '48%', 'marginRight': '4%', 'backgroundColor': '#007bff',
-                                   'color': 'white'}),
+                            style={"width": "48%", "marginRight": "4%", "backgroundColor": "#007bff", "color": "white"}),
                 html.Button("+1m", id="btn-up1", n_clicks=0,
-                            style={'width': '22%', 'backgroundColor': '#ffc107', 'color': 'black'}),
+                            style={"width": "22%", "backgroundColor": "#ffc107"}),
                 html.Button("-1m", id="btn-dn1", n_clicks=0,
-                            style={'width': '22%', 'marginLeft': '4%', 'backgroundColor': '#ffc107', 'color': 'black'}),
-            ], style={'marginBottom': '10px'}),
+                            style={"width": "22%", "marginLeft": "4%", "backgroundColor": "#ffc107"}),
+            ], style={"marginBottom": "10px"}),
 
-            html.Hr(),
-
-            # --- בקרת מצב טיסה וחימוש (חדש) ---
-            html.H4("בקרת טיסה וחירום",
-                    style={'marginTop': '10px', 'fontSize': '16px', 'borderBottom': '1px solid #ccc',
-                           'paddingBottom': '5px'}),
-
-            # Arm/Disarm/E-Stop Buttons
+            html.H4("Flight", style=STYLES["section_title"]),
             html.Div([
-                html.Button("ARM (חימוש)", id="btn-arm", n_clicks=0,
-                            style={'width': '32%', 'marginRight': '2%', 'backgroundColor': '#008000', 'color': 'white',
-                                   'fontWeight': 'bold'}),
-                html.Button("DISARM (נטרול)", id="btn-disarm", n_clicks=0,
-                            style={'width': '32%', 'marginRight': '2%', 'backgroundColor': '#FFA500', 'color': 'black',
-                                   'fontWeight': 'bold'}),
-                html.Button("E-STOP (הרג)", id="btn-emergency-stop", n_clicks=0,
-                            style={'width': '32%', 'backgroundColor': '#FF0000', 'color': 'white',
-                                   'fontWeight': 'bold'}),
-            ], style={'marginBottom': '10px'}),
+                html.Button("ARM", id="btn-arm", n_clicks=0,
+                            style={"width": "32%", "marginRight": "2%", "backgroundColor": "#008000",
+                                   "color": "white", "fontWeight": "bold"}),
+                html.Button("DISARM", id="btn-disarm", n_clicks=0,
+                            style={"width": "32%", "marginRight": "2%", "backgroundColor": "#FFA500",
+                                   "color": "black", "fontWeight": "bold"}),
+                html.Button("E-STOP", id="btn-emergency-stop", n_clicks=0,
+                            style={"width": "32%", "backgroundColor": "#FF0000",
+                                   "color": "white", "fontWeight": "bold"}),
+            ], style={"marginBottom": "10px"}),
 
-            # Mode Change Dropdown
             html.Div([
                 dcc.Dropdown(
-                    id='dropdown-flight-mode',
+                    id="dropdown-flight-mode",
                     options=[
-                        {'label': 'Stabilize', 'value': 'STABILIZE'},
-                        {'label': 'Loiter', 'value': 'LOITER'},
-                        {'label': 'Alt Hold', 'value': 'ALT_HOLD'},
-                        {'label': 'Guided', 'value': 'GUIDED'},
-                        {'label': 'RTL (חזרה לבית)', 'value': 'RTL'},
-                        {'label': 'Land (נחיתה)', 'value': 'LAND'}
+                        {"label": "Stabilize", "value": "STABILIZE"},
+                        {"label": "Loiter", "value": "LOITER"},
+                        {"label": "Alt Hold", "value": "ALT_HOLD"},
+                        {"label": "Guided", "value": "GUIDED"},
+                        {"label": "RTL", "value": "RTL"},
+                        {"label": "Land", "value": "LAND"},
                     ],
-                    value='LOITER',
-                    placeholder="בחר מצב טיסה",
-                    style={'width': '100%'}
+                    value="LOITER",
+                    placeholder="Select flight mode",
+                    style={"width": "100%"},
                 ),
-                html.Button("החל מצב", id="btn-set-mode", n_clicks=0,
-                            style={'width': '100%', 'backgroundColor': '#4CAF50', 'color': 'white', 'padding': '6px',
-                                   'marginTop': '5px'}),
-            ], style={'marginBottom': '10px'}),
+                html.Button("Set Mode", id="btn-set-mode", n_clicks=0,
+                            style={"width": "100%", "marginTop": "6px", "backgroundColor": "#4CAF50", "color": "white"}),
+            ], style={"marginBottom": "10px"}),
 
-            html.Hr(),
-
-            # --- כפתורי YOLO (כפי שהיו) ---
+            # Takeoff
             html.Div([
-                html.Button("התחל זיהוי (YOLO)", id="btn-start-yolo", n_clicks=0,
-                            style={'width': '48%', 'marginRight': '4%', 'backgroundColor': '#dc3545',
-                                   'color': 'white'}),
-                html.Button("עצור זיהוי", id="btn-stop-yolo", n_clicks=0,
-                            style={'width': '48%', 'backgroundColor': '#ffc107', 'color': 'black'}),
-            ], style={'marginBottom': '10px'}),
+                html.B("Takeoff Alt (m):"),
+                dcc.Input(id="takeoff-alt", type="number", placeholder="e.g. 20",
+                          style={"width": "45%", "marginRight": "5px"}),
+                html.Button("Takeoff", id="btn-takeoff", n_clicks=0,
+                            style={"width": "45%", "backgroundColor": "#6c757d", "color": "white"}),
+            ], style={"marginBottom": "10px"}),
 
-            html.Hr(),
-
-            # --- קלט סינון מחלקות (Class Filter) ---
+            # Set Home + Disable Fence
             html.Div([
-                html.B("סינון מחלקות:", style={'display': 'block', 'marginBottom': '5px'}),
+                html.B("Set Home:"),
+                dcc.Input(id="home-lat", type="text", placeholder="lat", style={"width": "30%", "marginRight": "3px"}),
+                dcc.Input(id="home-lon", type="text", placeholder="lon", style={"width": "30%", "marginRight": "3px"}),
+                dcc.Input(id="home-alt", type="text", placeholder="alt", style={"width": "30%"}),
+                html.Button("Set Home", id="btn-set-home", n_clicks=0,
+                            style={"width": "100%", "marginTop": "6px", "backgroundColor": "#17a2b8", "color": "white"}),
+                html.Button("Disable Fence", id="btn-disable-fence", n_clicks=0,
+                            style={"width": "100%", "marginTop": "6px", "backgroundColor": "#dc3545", "color": "white"}),
+            ], style={"marginBottom": "10px"}),
 
-                # Checkboxes
+            html.H4("Detection (optional)", style=STYLES["section_title"]),
+            html.Div([
+                html.Button("Start YOLO", id="btn-start-yolo", n_clicks=0,
+                            style={"width": "48%", "marginRight": "4%", "backgroundColor": "#dc3545", "color": "white"}),
+                html.Button("Stop YOLO", id="btn-stop-yolo", n_clicks=0,
+                            style={"width": "48%", "backgroundColor": "#ffc107"}),
+            ], style={"marginBottom": "10px"}),
+
+            html.Div([
+                html.B("Class filter:"),
                 dcc.Checklist(
                     id="checklist-predefined-classes",
-                    options=[
-                        {'label': 'אדם (0)', 'value': '0'},
-                        {'label': 'טלוויזיה/מוניטור (62)', 'value': '62'}
-                    ],
-                    value=['0'],  # ברירת מחדל: אדם
-                    inline=False,
-                    style={'marginBottom': '5px'}
+                    options=[{"label": "person (0)", "value": "0"}, {"label": "tv/monitor (62)", "value": "62"}],
+                    value=["0"]
                 ),
-
-                # Custom Text Input
-                html.B("הזנת IDs נוספים (מופרדים בפסיקים):",
-                       style={'display': 'block', 'marginBottom': '3px', 'fontSize': '12px', 'marginTop': '10px'}),
-                dcc.Input(
-                    id="input-custom-classes",
-                    type="text",
-                    placeholder="2, 17, 39...",
-                    style={'width': '100%'},
-                    value=""
-                ),
-
-                html.Button("החל פילטר", id="btn-apply-classes", n_clicks=0,
-                            style={'width': '100%', 'backgroundColor': '#007bff', 'color': 'white', 'padding': '6px',
-                                   'marginTop': '10px'}),
-            ], style={'marginBottom': '10px'}),
+                dcc.Input(id="input-custom-classes", type="text", placeholder="2,17,39",
+                          style={"width": "100%", "marginTop": "6px"}),
+                html.Button("Apply classes", id="btn-apply-classes", n_clicks=0,
+                            style={"width": "100%", "marginTop": "6px", "backgroundColor": "#007bff", "color": "white"}),
+            ]),
 
             html.Hr(),
 
-            # --- נתוני יעד / BBox ---
-            html.Div(id="target-info", style={'fontSize': '14px', 'fontWeight': 'bold'}),
-            html.Div(id="bbox-data-display",
-                     style={'fontSize': '14px', 'whiteSpace': 'pre-wrap', 'fontFamily': 'monospace',
-                            'marginTop': '5px'}),
+            # Target/BBox panels EXIST to match callback outputs
+            html.Div(id="target-info", style={"fontSize": "14px", "fontWeight": "bold"}),
+            html.Pre(id="bbox-data-display",
+                     style={"fontSize": "13px", "whiteSpace": "pre-wrap", "fontFamily": "monospace",
+                            "marginTop": "5px", "maxHeight": "140px", "overflowY": "auto"}),
+
+            html.Hr(),
+
+            html.Pre(id="cmd-status-log",
+                     style={"fontSize": "12px", "whiteSpace": "pre-wrap", "fontFamily": "monospace",
+                            "maxHeight": "140px", "overflowY": "auto", "border": "1px solid #ddd", "padding": "6px"}),
         ])
     ]),
 
-    # 3. רצועת טלמטריה תחתונה
-    html.Div(id="info-strip", children="ממתין לנתוני MAVLink...", style=STYLES['telemetry_strip']),
+    html.Div(id="info-strip", children="Waiting for MAVLink...", style=STYLES["strip"]),
 ])
 
-
-# ================= Callbacks (מעודכן) =================
-
-# --- 1. עדכון מפה וטלמטריה (ללא שינוי) ---
+# ---------------- Callbacks ----------------
 @callback(
     Output("drone-marker", "position"),
     Output("drone-tooltip", "children"),
@@ -319,198 +281,194 @@ app.layout = html.Div(style=STYLES['main_container'], children=[
     Output("goto-line", "color"),
     Output("target-info", "children"),
     Output("bbox-data-display", "children"),
-    Input("interval-1s", "n_intervals")
+    Input("interval-1s", "n_intervals"),
 )
-def update_telemetry_and_map(n):
-    data = global_mav_data
-    lat, lon = data['lat'], data['lon']
+def update_telemetry_and_map(_n):
+    d = global_mav_data
+    lat, lon = d["lat"], d["lon"]
 
-    # --- עדכון מיקום ואינפו ---
     if lat is None or lon is None or (lat == 0.0 and lon == 0.0):
-        info_text = f"Alt: {data['alt']:.2f}m | Mode: {data['flight_mode']} | ממתין ל-GPS..."
-        return no_update, no_update, info_text, [[0, 0], [0, 0]], [[0, 0],
-                                                                   [0, 0]], "red", "אין יעד מוגדר", "אין איתור כרגע"
+        info_text = f"Mode: {d['flight_mode']} | Alt: {d['alt']:.1f}m | Waiting for GPS..."
+        return no_update, no_update, info_text, [[0, 0], [0, 0]], [[0, 0], [0, 0]], "red", "No target", "No detection"
 
-    # --- טלמטריה ---
-    position = [lat, lon]
-    tooltip_text = f"Alt: {data['alt']:.1f}m | GS: {data['vfr_hud_gs']:.1f}m/s"
-    info_strip_text = (
-        f"**Mode:** {data['flight_mode']} | **Lat/Lon:** {lat:.5f}, {lon:.5f} | "
-        f"**Alt:** {data['alt']:.1f}m | **GS:** {data['vfr_hud_gs']:.1f}m/s | **Heading:** {data['heading']}° | "
-        f"**Roll/Pitch:** {data['roll']:.1f}°/{data['pitch']:.1f}° | **Batt:** {data['volt']:.1f}V / {data['current']:.1f}A"
+    # positions
+    marker_pos = [lat, lon]
+    tooltip = f"Alt: {d['alt']:.1f} m | GS: {d['vfr_hud_gs']:.1f} m/s"
+    strip = (
+        f"Mode: {d['flight_mode']} | Lat/Lon: {lat:.5f}, {lon:.5f} | "
+        f"Alt: {d['alt']:.1f} m | GS: {d['vfr_hud_gs']:.1f} m/s | "
+        f"Hdg: {d['heading']:.0f} deg | Roll/Pitch: {d['roll']:.1f}/{d['pitch']:.1f} deg"
     )
 
-    # --- קו כיוון (Heading) ---
-    end_lat = lat + 0.0001 * math.cos(math.radians(data['heading']))
-    end_lon = lon + 0.0001 * math.sin(math.radians(data['heading']))
+    # heading line
+    end_lat = lat + 0.0001 * math.cos(math.radians(d["heading"]))
+    end_lon = lon + 0.0001 * math.sin(math.radians(d["heading"]))
     heading_positions = [[lat, lon], [end_lat, end_lon]]
 
-    # --- נתוני יעד וקו Go-To ---
+    # target info
     goto_positions = [[0, 0], [0, 0]]
     goto_color = "red"
-    target_info_text = "אין יעד מוגדר"
-
-    if data['target_lat'] is not None and data['target_lon'] is not None:
-        target_lat, target_lon = data['target_lat'], data['target_lon']
-
-        bearing_to_target = calculate_bearing(lat, lon, target_lat, target_lon)
-        distance_m = 10  # ערך דמה
-
+    target_info_text = "No target set"
+    if d["target_lat"] is not None and d["target_lon"] is not None:
+        tlat, tlon = d["target_lat"], d["target_lon"]
+        bearing = calculate_bearing(lat, lon, tlat, tlon)
+        # distance is optional; keep simple dummy for now
+        dist_m = 10.0
         target_info_text = (
-            f"**Target:** {target_lat:.5f}, {target_lon:.5f} (Alt: {data['target_alt']}m)\n"
-            f"**Bearing:** {bearing_to_target:.1f}° | **Distance (Dummy):** {distance_m:.1f}m"
+            f"Target: {tlat:.5f}, {tlon:.5f} (Alt: {d['target_alt']})\n"
+            f"Bearing: {bearing:.1f} deg | Distance: {dist_m:.1f} m"
         )
+        goto_positions = [[lat, lon], [tlat, tlon]]
+        goto_color = "green" if dist_m < 5.0 else "red"
 
-        goto_positions = [[lat, lon], [target_lat, target_lon]]
-        goto_color = "green" if distance_m < 5 else "red"
-
-        # --- BBox טקסטואלי ---
-    if data['bbox']:
-        # BBox format: x1, y1, x2, y2, track_id
-        x1, y1, x2, y2, track_id = data['bbox']
-
-        bbox_display = f"**!! אובייקט זוהה !!**\nTrack ID: {int(track_id)}\nx1:{x1:.0f}, y1:{y1:.0f}\nx2:{x2:.0f}, y2:{y2:.0f}"
+    # bbox panel
+    if d["bbox"]:
+        try:
+            x1, y1, x2, y2, tid = d["bbox"]
+            bbox_txt = f"DETECTION\nTrack: {int(tid)}\n({x1:.0f},{y1:.0f}) -> ({x2:.0f},{y2:.0f})"
+        except Exception:
+            bbox_txt = f"DETECTION\n{d['bbox']}"
     else:
-        # data['bbox'] הוא None (כאשר הטרקר שלח null)
-        bbox_display = "אין איתור כרגע (אובייקט אבד)"
+        bbox_txt = "No detection"
 
-    return position, tooltip_text, info_strip_text, heading_positions, goto_positions, goto_color, target_info_text, bbox_display
+    return marker_pos, tooltip, strip, heading_positions, goto_positions, goto_color, target_info_text, bbox_txt
 
 
-# --- 2. טיפול בפקודות שליטה (מעודכן לחימוש ומצבים) ---
 @callback(
     Output("map", "center"),
-    # פקדי Go-To / Hold / Alt
+    Output("cmd-status-log", "children"),
     Input("btn-goto", "n_clicks"),
     Input("btn-hold", "n_clicks"),
     Input("btn-up1", "n_clicks"),
     Input("btn-dn1", "n_clicks"),
-    # פקדי YOLO
     Input("btn-start-yolo", "n_clicks"),
     Input("btn-stop-yolo", "n_clicks"),
     Input("btn-apply-classes", "n_clicks"),
-    # פקדי טיסה (חדש)
     Input("btn-set-mode", "n_clicks"),
     Input("btn-arm", "n_clicks"),
     Input("btn-disarm", "n_clicks"),
     Input("btn-emergency-stop", "n_clicks"),
-
-    # States
+    Input("btn-takeoff", "n_clicks"),
+    Input("btn-set-home", "n_clicks"),
+    Input("btn-disable-fence", "n_clicks"),
     State("input-gps-full", "value"),
     State("input-alt", "value"),
     State("checklist-predefined-classes", "value"),
     State("input-custom-classes", "value"),
-    State("dropdown-flight-mode", "value"),  # חדש
-    prevent_initial_call=True
+    State("dropdown-flight-mode", "value"),
+    State("takeoff-alt", "value"),
+    State("home-lat", "value"),
+    State("home-lon", "value"),
+    State("home-alt", "value"),
+    State("cmd-status-log", "children"),
+    prevent_initial_call=True,
 )
-def handle_control_buttons(goto_n, hold_n, up_n, dn_n, start_n, stop_n, apply_n,
-                           set_mode_n, arm_n, disarm_n, emergency_stop_n,
-                           v_gps_full, v_alt, v_checked_classes, v_custom_classes, v_flight_mode):
+def handle_controls(goto_n, hold_n, up_n, dn_n, start_n, stop_n, apply_n,
+                    setmode_n, arm_n, disarm_n, estop_n, takeoff_n, sethome_n, fence_n,
+                    v_gps, v_alt, v_checked, v_custom, v_mode, v_tko_alt,
+                    v_home_lat, v_home_lon, v_home_alt, log_text):
+
     which = ctx.triggered_id
+    logs = log_text or ""
+    def append_log(line):
+        nonlocal logs
+        logs = (logs + "\n" + line).strip()
+
+    # default center: keep map where it is
+    new_center = no_update
 
     if which == "btn-goto":
-        v_lat = None
-        v_lon = None
-        target_alt = None
-
-        # 1. ניתוח GPS
+        lat = lon = None
+        alt = None
         try:
-            parts = [p.strip() for p in v_gps_full.split(',')]
+            parts = [p.strip() for p in (v_gps or "").split(",")]
             if len(parts) == 2:
-                v_lat = float(parts[0])
-                v_lon = float(parts[1])
+                lat = float(parts[0]); lon = float(parts[1])
         except Exception:
-            print("[CMD] GPS parsing FAILED. Format must be 'Lat, Lon'.")
-
-        # 2. קביעת גובה יעד (משתמש בגובה נוכחי אם לא הוזן)
-        if v_alt is not None and str(v_alt).strip() != '':
+            append_log("[ERR] GPS parse failed. Use 'lat, lon'.")
+        if v_alt is not None and str(v_alt).strip() != "":
             try:
-                target_alt = float(v_alt)
-            except ValueError:
-                print("[CMD] Altitude input is not a valid number. Ignoring.")
-
-        if target_alt is None:
-            if global_mav_data['alt'] is not None:
-                target_alt = global_mav_data['alt']
-                print(f"[CMD] Go-To: Altitude not specified/invalid. Using current drone altitude: {target_alt:.1f}m")
-            else:
-                print("[CMD] Go-To: Altitude not specified and current altitude is UNKNOWN. Cannot proceed.")
-
-        # 3. ביצוע הפקודה
-        if v_lat is None or v_lon is None or target_alt is None:
-            print("[CMD] Go-To missing valid GPS or Alt.")
+                alt = float(v_alt)
+            except Exception:
+                append_log("[WARN] Alt not numeric; using current.")
+        if alt is None:
+            alt = global_mav_data["alt"] if global_mav_data["alt"] is not None else 5.0
+        if lat is None or lon is None:
+            append_log("[ERR] Missing lat/lon for Go-To.")
         else:
-            if send_command_to_tracker("GOTO_GPS", {"lat": v_lat, "lon": v_lon, "alt": target_alt}):
-                global_mav_data['target_lat'] = v_lat
-                global_mav_data['target_lon'] = v_lon
-                global_mav_data['target_alt'] = target_alt
+            line = send_command_to_tracker("GOTO_GPS", {"lat": lat, "lon": lon, "alt": float(alt)})
+            append_log(line)
+            global_mav_data["target_lat"] = lat
+            global_mav_data["target_lon"] = lon
+            global_mav_data["target_alt"] = float(alt)
+            new_center = [lat, lon]
 
     elif which == "btn-hold":
-        send_command_to_tracker("HOLD_HERE")
-        global_mav_data['target_lat'] = None
-        global_mav_data['target_lon'] = None
+        append_log(send_command_to_tracker("HOLD_HERE"))
+        global_mav_data["target_lat"] = None
+        global_mav_data["target_lon"] = None
+        global_mav_data["target_alt"] = None
 
     elif which == "btn-up1":
-        send_command_to_tracker("ALT_BUMP", {"delta": 1.0})
-
+        append_log(send_command_to_tracker("ALT_BUMP", {"delta": 1.0}))
     elif which == "btn-dn1":
-        send_command_to_tracker("ALT_BUMP", {"delta": -1.0})
+        append_log(send_command_to_tracker("ALT_BUMP", {"delta": -1.0}))
 
     elif which == "btn-start-yolo":
-        send_command_to_tracker("START_YOLO")
+        append_log(send_command_to_tracker("START_YOLO"))
     elif which == "btn-stop-yolo":
-        send_command_to_tracker("STOP_YOLO")
-
+        append_log(send_command_to_tracker("STOP_YOLO"))
     elif which == "btn-apply-classes":
+        all_ids = []
+        if v_checked:
+            all_ids.extend(v_checked)
+        if v_custom and v_custom.strip():
+            all_ids.extend([c.strip() for c in v_custom.split(",") if c.strip()])
+        # keep numeric only
+        num_ids = []
+        for s in all_ids:
+            try:
+                num_ids.append(int(s))
+            except Exception:
+                pass
+        uniq = sorted(set(num_ids))
+        append_log(send_command_to_tracker("SET_CLASSES", {"classes": ",".join(str(x) for x in uniq)}))
 
-        all_classes_list = []
-
-        if v_checked_classes:
-            all_classes_list.extend(v_checked_classes)
-
-        if v_custom_classes and v_custom_classes.strip():
-            custom_parts = [c.strip() for c in v_custom_classes.split(',') if c.strip()]
-            all_classes_list.extend(custom_parts)
-
-        try:
-            unique_classes = sorted(list(set(all_classes_list)), key=int)
-            final_class_string = ",".join(str(c) for c in unique_classes)
-        except ValueError:
-            print("[CMD] Class Filter: Invalid character detected in custom input. Using only valid numbers.")
-            final_class_string = ",".join(sorted(list(set([c for c in all_classes_list if c.isdigit()])), key=int))
-
-        if final_class_string:
-            send_command_to_tracker("SET_CLASSES", {"classes": final_class_string})
-        else:
-            send_command_to_tracker("SET_CLASSES", {"classes": ""})
-            print("[CMD] Class Filter is empty. Sending an empty list.")
-
-    # --- פקודות חדשות ---
     elif which == "btn-set-mode":
-        if v_flight_mode:
-            send_command_to_tracker("SET_MODE", {"mode": v_flight_mode})
+        if v_mode:
+            append_log(send_command_to_tracker("SET_MODE", {"mode": v_mode}))
 
     elif which == "btn-arm":
-        send_command_to_tracker("ARM")
-
+        append_log(send_command_to_tracker("ARM"))
     elif which == "btn-disarm":
-        send_command_to_tracker("DISARM")
-
+        append_log(send_command_to_tracker("DISARM"))
     elif which == "btn-emergency-stop":
-        send_command_to_tracker("EMERGENCY_STOP")
-    # -------------------
+        append_log(send_command_to_tracker("EMERGENCY_STOP"))
 
-    return no_update
+    elif which == "btn-takeoff":
+        try:
+            alt = float(v_tko_alt) if v_tko_alt is not None else 20.0
+        except Exception:
+            alt = 20.0
+        append_log(send_command_to_tracker("TAKEOFF", {"alt": float(alt)}))
 
+    elif which == "btn-set-home":
+        try:
+            hlat = float(v_home_lat)
+            hlon = float(v_home_lon)
+            halt = float(v_home_alt) if v_home_alt not in (None, "") else 10.0
+            append_log(send_command_to_tracker("SET_HOME", {"lat": hlat, "lon": hlon, "alt": halt}))
+        except Exception:
+            append_log("[ERR] Set Home needs numeric lat/lon (and optional alt).")
 
-# ------------------------------------------------
+    elif which == "btn-disable-fence":
+        append_log(send_command_to_tracker("DISABLE_FENCE"))
 
+    return new_center, logs
+
+# ---------------- Boot ----------------
 if __name__ == "__main__":
-    # Start UDP listeners for data coming from the Tracker/Proxy
     threading.Thread(target=udp_listener_tel, daemon=True).start()
     threading.Thread(target=udp_listener_bbox, daemon=True).start()
-
-    print("---" * 20)
-    print(f"Flask/Dash Map started. Check http://127.0.0.1:8050/")
-
+    print("Dash listening at http://127.0.0.1:8050/")
     app.run(debug=True, port=8050, use_reloader=False)

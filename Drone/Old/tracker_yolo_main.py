@@ -20,10 +20,15 @@ except ImportError:
     from pymavlink.dialects.v20 import common as mavlink
 
 # --- MAVLink Settings ---
-MAVLINK_DEVICE = 'COM4'
-MAVLINK_BAUD = 57600
+#MAVLINK_DEVICE = 'COM4'
+#MAVLINK_BAUD = 57600
+
+# לזה (עבור סימולטור SITL מקומי):
+MAVLINK_DEVICE = 'udp:0.0.0.0:14551'
+MAVLINK_BAUD = 115200
 MAVLINK_CONN = None
 GUIDED_KEEPALIVE_PERIOD = 0.5
+
 
 # --- Communication Ports ---
 UDP_IP = '127.0.0.1'
@@ -316,7 +321,7 @@ def start_yolo_detection():
                 raise IOError(f"Cannot open camera index {YOLO_CAM_INDEX}")
 
             # 2. YOLO
-            model = YOLO('yolov8n.pt')
+            model = YOLO('../../yolov8n.pt')
 
             # 3. DeepSORT
             tracker = DeepSort(max_age=5, nms_max_overlap=0.7, embedder='mobilenet', half=True)
